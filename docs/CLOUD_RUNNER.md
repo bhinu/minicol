@@ -1,8 +1,12 @@
 # Cloud worker for minicol
 
-The prepared GitHub Actions workflow is `.github/workflows/cloud-agent.yml`; `docs/cloud-agent-workflow.yml` is a reviewable copy. GitHub-hosted Ubuntu runners can work while the owner's laptop is off. The worker is hourly, at minute 17 UTC, and also supports manual dispatch. GitHub schedules can be delayed; this is periodic development, not an always-running server.
+The active GitHub Actions workflow is `.github/workflows/cloud-agent.yml`; `docs/cloud-agent-workflow.yml` is a reviewable copy. GitHub-hosted Ubuntu runners can work while the owner's laptop is off. The worker is hourly, at minute 17 UTC, and also supports manual dispatch. GitHub schedules can be delayed; this is periodic development, not an always-running server.
 
-## Activate
+## Verified status — 2026-10-27
+
+The OPENAI_API_KEY secret is installed, MINICOL_AGENT_ENABLED is true, and the first full [cloud run](https://github.com/bhinu/minicol/actions/runs/40596007041) passed generation, isolated validation, and publication. It pushed [af440d8](https://github.com/bhinu/minicol/commit/af440d88af2e535768be006058f9bfdc81355677), adding conjunction predicates with selection vectors. GitHub resolves the author to bhinu; the committer is github-actions[bot]. The earlier local hourly automation has been paused. Linux and macOS correctness CI also passed on the setup commit.
+
+## Activation reference
 
 1. Grant the local GitHub CLI workflow-upload permission: `gh auth refresh -h github.com -s workflow`. Complete GitHub's browser authorization. Push the prepared workflow commit to main.
 2. In GitHub repository Settings → Secrets and variables → Actions, add a **repository secret** named `OPENAI_API_KEY`. Use an OpenAI API project key with funded billing and suitable model access. Never paste the key into chat, the repository, a workflow file, or logs. API usage is billed separately from a ChatGPT subscription. Configure a project budget/alerts in the API dashboard.

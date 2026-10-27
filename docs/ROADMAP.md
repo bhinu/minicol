@@ -55,3 +55,7 @@ Prepared hourly generation → isolated validation → publication workflow, pin
   currently stay internal and each visited predicate chunk is decoded in full.
   Workload-driven predicate ordering, AND benchmark workloads, fuzzing/resource
   limits, and streaming readers/writers remain future work.
+
+## Cloud handoff verified — 2026-10-27
+
+First cloud run 40596007041 passed all three jobs and published af440d8 with bhinu author attribution. API credential and hourly enable switch are configured. Local hourly automation paused after verification. Generation, validation, and publication now run on GitHub-hosted runners independently of the Mac. See docs/CLOUD_RUNNER.md for controls and run evidence.

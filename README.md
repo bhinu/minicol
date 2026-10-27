@@ -43,7 +43,7 @@ Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
 
 ## Evidence and boundaries
 
-An hourly GitHub-hosted development worker and Linux/macOS CI are prepared. Cloud activation requires workflow-upload permission, an `OPENAI_API_KEY` repository secret, and the `MINICOL_AGENT_ENABLED=true` repository variable. See [cloud runner setup and controls](docs/CLOUD_RUNNER.md). The local hourly automation should be disabled only after the first cloud run succeeds.
+An hourly GitHub-hosted development worker is active and its first generation, validation, and commit-push run passed. Linux/macOS correctness CI also passed. The previous local hourly automation is paused. See [cloud runner setup, controls, and evidence](docs/CLOUD_RUNNER.md).
 
 See [measured benchmarks](docs/BENCHMARKS.md), [raw trials](docs/benchmark-raw.csv), [format](docs/FORMAT.md), [Claude resume handoff](docs/CLAUDE_HANDOFF.md), and [roadmap](docs/ROADMAP.md).
 
