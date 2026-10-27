@@ -1,0 +1,5 @@
+rows=1000000 row_store_bytes=152000000 column_store_bytes=107261051 metadata_bytes=6199 seed=42
+plain_chunks=16
+dictionary_chunks=16
+rle_chunks=16
+bitpacked_chunks=32
