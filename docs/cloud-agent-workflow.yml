@@ -1,0 +1,119 @@
+name: Minicol cloud agent
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minicol-cloud-agent
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    if: github.repository == 'bhinu/minicol' && vars.MINICOL_AGENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      base: ${{ steps.base.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check configuration
+        env:
+          API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$API_KEY" ]; then
+            echo 'Add the OPENAI_API_KEY repository secret before enabling the worker.' >&2
+            exit 1
+          fi
+      - name: Save trusted patch exporter and baseline
+        id: base
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cp scripts/cloud_patch.py "$RUNNER_TEMP/cloud_patch.py"
+      - name: Generate one improvement
+        uses: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: scripts/cloud-agent-prompt.md
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+          codex-version: '0.165.0'
+          model: ${{ vars.MINICOL_CODEX_MODEL }}
+          effort: medium
+      - name: Export bounded candidate
+        run: python3 "$RUNNER_TEMP/cloud_patch.py" capture "$RUNNER_TEMP/candidate/changes.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate/changes.patch
+          retention-days: 7
+          if-no-files-found: error
+
+  validate:
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.generate.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Apply and validate candidate paths
+        run: python3 scripts/cloud_patch.py apply "$RUNNER_TEMP/candidate/changes.patch"
+      - run: python3 scripts/test_cloud_patch.py
+      - run: make test
+      - run: make sanitize
+      - run: make build/benchmark && ./build/benchmark 10000 1 build/smoke > build/smoke.csv
+
+  publish:
+    needs: [generate, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Refuse stale candidates
+        env:
+          EXPECTED_BASE: ${{ needs.generate.outputs.base }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_BASE" ]; then
+            echo 'main advanced during validation; next run will start from the new main.' >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Apply tested patch
+        run: python3 scripts/cloud_patch.py apply "$RUNNER_TEMP/candidate/changes.patch"
+      - name: Commit and push useful changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if git diff --cached --quiet; then
+            echo 'No source changes; no commit needed.'
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit --author='Bhinu Santosh <bhinusantosh@gmail.com>' \
+              -m 'Improve minicol with validated cloud-agent changes' \
+              -m "Generated and tested by the minicol cloud worker. Run: $RUN_URL"
+          git -c credential.helper= \
+              -c 'credential.helper=!gh auth git-credential' push origin HEAD:main

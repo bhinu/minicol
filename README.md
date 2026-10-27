@@ -39,7 +39,7 @@ Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
 
 ## Evidence and boundaries
 
-The CI template is in `docs/ci-workflow.yml`. The current GitHub login lacks the `workflow` scope, so it is not active. After granting that permission, move it to `.github/workflows/ci.yml` and push.
+An hourly GitHub-hosted development worker and Linux/macOS CI are prepared. Cloud activation requires workflow-upload permission, an `OPENAI_API_KEY` repository secret, and the `MINICOL_AGENT_ENABLED=true` repository variable. See [cloud runner setup and controls](docs/CLOUD_RUNNER.md). The local hourly automation should be disabled only after the first cloud run succeeds.
 
 See [measured benchmarks](docs/BENCHMARKS.md), [raw trials](docs/benchmark-raw.csv), [format](docs/FORMAT.md), [Claude resume handoff](docs/CLAUDE_HANDOFF.md), and [roadmap](docs/ROADMAP.md).
 
