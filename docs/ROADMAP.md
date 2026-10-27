@@ -6,7 +6,7 @@
 - 1,659 correctness checks, independent scalar oracles, randomized and malformed-file cases, ASan and UBSan.
 - Five deterministic one-million-row benchmark workloads, seven trials per method, raw CSV and methodology.
 - Make targets, Linux/macOS GitHub Actions template (inactive: login needs workflow scope), format docs, and resume evidence handoff.
-- Private GitHub origin and hourly chat automation; commits use repository configured author identity.
+- Public GitHub origin and hourly chat automation; commits use repository configured author identity.
 
 ## Next useful improvements, in order
 

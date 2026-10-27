@@ -60,7 +60,7 @@ Full column file is 107,261,051 bytes versus the fixed-width row file's 152,000,
 (root/'docs/BENCHMARKS.md').write_text(report)
 handoff = f'''# Claude resume handoff
 
-Repository: https://github.com/bhinu/minicol (private; share access or paste this packet).
+Repository: https://github.com/bhinu/minicol (public).
 
 Use the facts below to update my projects section for storage/database/systems roles. Keep the writing direct and specific. Produce two or three concise bullets. Do not invent usage, employers, production impact, concurrency, SQL, SIMD, or distributed systems features. This project was implemented with AI assistance; do not describe it as independently hand-coded. I should review the implementation and be able to explain it before using the bullets.
 
