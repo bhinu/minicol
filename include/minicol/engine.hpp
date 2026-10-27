@@ -24,6 +24,7 @@ public:
  uint64_t metadata_bytes() const { return metadata_bytes_; }
  Column read_column(size_t group, size_t column) const;
  ScanResult scan(const Predicate& predicate, bool zone_maps=true) const;
+ ScanResult scan_all(const std::vector<Predicate>& predicates, bool zone_maps=true) const;
 private:
  std::string path_;
  std::vector<Field> schema_;

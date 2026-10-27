@@ -1,0 +1,21 @@
+rows=10000 row_store_bytes=1520000 column_store_bytes=1070772 metadata_bytes=484 seed=42
+plain_chunks=1
+dictionary_chunks=1
+rle_chunks=1
+bitpacked_chunks=2
+
+Purpose: correctness/regression smoke only; no performance comparison or claim.
+Command: ./build/benchmark 10000 1 build/data-smoke > docs/benchmark-smoke-2026-10-27.csv 2> docs/benchmark-smoke-2026-10-27-environment.txt
+Build: make build/benchmark
+Flags: -Iinclude -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic
+Compiler: c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+Machine: Linux 6.17.0-1022-azure x86_64; AMD EPYC 9V45 96-Core Processor
+Rows: 10000; seed: 42; timed trials: 1 per method per query (15 raw trials).
+Default row group size: 65536; sample size: 2048; one group at this scale.
+Cache: newly written files, one untimed warmup per method/query, no cache eviction;
+assume OS-cached data. Timed scans reopen files and parse metadata.
+Byte accounting: logical file bytes requested, including metadata for column scans;
+not physical disk reads. Row baseline uses 152-byte fixed-width records.
+Limits: synthetic data, shared cloud machine, one trial, one row group. Existing
+single-predicate workloads only; AND correctness is tested by scalar oracles.
+These trials do not measure AND performance or establish speedups.

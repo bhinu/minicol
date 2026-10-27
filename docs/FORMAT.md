@@ -66,10 +66,31 @@ encoding and exact zone bounds are persisted in the footer.
 
 ## Scan semantics and accounting
 
-A scan evaluates one typed equality or inclusive range predicate and returns a
-count. A reversed range is empty. It reads only that predicate column. Zone maps
-skip groups whose exact minimum/maximum excludes the predicate. String
-predicates evaluate each dictionary entry once and then filter integer IDs;
+`scan` evaluates one typed equality or inclusive range predicate and returns a
+count. `scan_all` evaluates an AND of such predicates, using sorted group-local
+uint32 row offsets as internal selection vectors. A reversed range is empty.
+An empty predicate list matches all rows using metadata alone, with zero groups
+read/skipped and zero batches. All predicates are type/operation/column checked
+before any pruning, including predicates after an impossible condition. Equality
+uses only the low bound; its high bound is ignored.
+
+AND scans read only predicate columns, in order of first appearance. Predicates
+on the same column are evaluated together, so each chunk is read at most once.
+With zone maps enabled, any excluded predicate skips the entire group before
+payload reads. Otherwise, selections are intersected across columns; an empty
+selection avoids reading later columns. Each loaded chunk is structurally
+validated; chunks skipped by zone maps or an empty selection are not payload-validated.
+Dictionary entries and RLE run values are tested against all predicates for that
+column once per entry/run. Multi-column selections use memory proportional to
+one row group's rows, in addition to the existing chunk decoder allocations;
+this is not a bounded-memory streaming reader.
+
+`groups_read` counts groups with any payload read; `groups_skipped` counts groups
+excluded by zone maps. Logical batches count each visited group's rows once,
+regardless of the number of predicate columns actually read. Predicate order can
+affect bytes read through early termination, but does not affect the count.
+
+String predicates evaluate each dictionary entry once and then filter integer IDs;
 matching rows do not materialize strings. RLE scans evaluate each run directly.
 Plain and packed chunks fill batches of up to 1,024 values; dictionary chunks
 fill batches of IDs. This is batched scalar C++, not a claim of explicit SIMD.
@@ -77,8 +98,8 @@ RLE scans exploit runs without expanding batches; the batch counter records
 logical 1,024-row batches in every visited group.
 
 `bytes_read` is logical bytes requested: header, entire footer and trailer once,
-plus encoded predicate chunk bytes read by that scan. It does not measure device
-I/O or cache misses. Reader construction loads metadata before `scan`; the
+plus encoded predicate chunk bytes actually read by that scan. It does not
+measure device I/O or cache misses. Reader construction loads metadata before `scan`; the
 counter includes those bytes even when a benchmark reuses a Reader. Payloads
 are loaded from the file anew for each scan. `read_column` reconstructs a full
 column chunk and is intended for round-trip checks and consumers requiring

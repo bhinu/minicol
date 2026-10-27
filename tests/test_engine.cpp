@@ -63,6 +63,44 @@ void scans(const Reader& reader, const std::vector<Column>& columns,
         check(pruned.bytes_read <= full.bytes_read, "pruned scan reads more bytes");
     }
 }
+uint64_t conjunction_oracle(const std::vector<Column>& columns,
+                            const std::vector<Predicate>& predicates) {
+    const auto rows = std::visit([](const auto& v) { return v.size(); }, columns.front());
+    uint64_t matched = 0;
+    for (size_t row = 0; row < rows; ++row) {
+        bool hit = true;
+        for (const auto& p : predicates) {
+            const auto v = std::visit([&](const auto& values) -> Value { return values[row]; },
+                                      columns.at(p.column));
+            if (!satisfies(v, p)) hit = false;
+        }
+        matched += hit;
+    }
+    return matched;
+}
+void conjunctions(const Reader& reader, const std::vector<Column>& columns,
+                  const std::vector<Predicate>& predicates) {
+    const auto expected = conjunction_oracle(columns, predicates);
+    for (bool zones : {false, true}) {
+        const auto result = reader.scan_all(predicates, zones);
+        check(result.matched == expected, "AND scan differs from scalar row oracle");
+        if (predicates.empty()) {
+            check(result.bytes_read == reader.metadata_bytes() && result.groups_read == 0 &&
+                  result.groups_skipped == 0 && result.batches == 0, "empty AND reads metadata only");
+            continue;
+        }
+        check(result.groups_read + result.groups_skipped == reader.groups().size(), "AND group accounting");
+        if (!zones) {
+            check(result.groups_read == reader.groups().size(), "unpruned AND visits every group");
+            uint64_t batches = 0;
+            for (const auto& g : reader.groups()) batches += (uint64_t(g.front().rows) + 1023) / 1024;
+            check(result.batches == batches, "AND logical batches counted once per group");
+        }
+        auto reversed = predicates;
+        std::reverse(reversed.begin(), reversed.end());
+        check(reader.scan_all(reversed, zones).matched == expected, "AND order independence");
+    }
+}
 void roundtrip(const std::string& path, const std::vector<Field>& schema,
                const std::vector<Column>& columns, uint32_t group_size = 1024,
                const std::vector<Predicate>& predicates = {}) {
@@ -95,6 +133,9 @@ void roundtrip(const std::string& path, const std::vector<Field>& schema,
         }
     }
     scans(reader, columns, predicates);
+    conjunctions(reader, columns, {});
+    for (size_t count = 1; count <= predicates.size(); ++count)
+        conjunctions(reader, columns, {predicates.begin(), predicates.begin() + count});
 }
 void encoding_tests(const Scratch& scratch) {
     std::mt19937_64 rng(7331);
@@ -177,11 +218,87 @@ void pruning_tests(const Scratch& scratch) {
     auto full = r.scan({0, Op::Between, int64_t(0), int64_t(8192)}, false);
     check(full.batches == 9, "1024-value batch accounting including tail");
 }
+void conjunction_tests(const Scratch& scratch) {
+    const size_t n = 8193;
+    std::vector<int64_t> small(n), plain(n), runs(n);
+    std::vector<std::string> dict(n), text(n), text_runs(n);
+    for (size_t i = 0; i < n; ++i) {
+        small[i] = int64_t(i % 31);
+        plain[i] = i % 2 ? std::numeric_limits<int64_t>::max() : std::numeric_limits<int64_t>::min();
+        runs[i] = int64_t(i / 1100);
+        dict[i] = "long-dictionary-label-" + std::to_string(i % 7);
+        text[i] = "unique-" + std::to_string(i) + std::string("\0tail", 5);
+        text_runs[i] = std::string(50, char('a' + i / 1100));
+    }
+    const std::vector<Column> columns{small, plain, runs, dict, text, text_runs};
+    const auto path = scratch.file("and.mc");
+    roundtrip(path, {{"small", Type::Int64}, {"plain", Type::Int64}, {"runs", Type::Int64},
+                    {"dict", Type::String}, {"text", Type::String}, {"text_runs", Type::String}},
+              columns, 4096);
+    Reader r(path);
+    const std::vector<Encoding> encodings{Encoding::BitPacked, Encoding::Plain, Encoding::RLE,
+                                         Encoding::Dictionary, Encoding::Plain, Encoding::RLE};
+    for (size_t c = 0; c < encodings.size(); ++c)
+        check(r.groups()[0][c].encoding == encodings[c], "AND fixture encoding");
+    // Every pair of codecs, including run boundaries and batch/group tails.
+    const std::vector<Predicate> filters{
+        {0, Op::Between, int64_t(3), int64_t(25)},
+        {1, Op::Equal, std::numeric_limits<int64_t>::max(), std::string()},
+        {2, Op::Between, int64_t(1), int64_t(6)},
+        {3, Op::Between, std::string("long-dictionary-label-2"), std::string("long-dictionary-label-5")},
+        {4, Op::Between, std::string("unique-200"), std::string("unique-8000z")},
+        {5, Op::Between, std::string(50, 'b'), std::string(50, 'g')}};
+    for (const auto& a : filters) for (const auto& b : filters) conjunctions(r, columns, {a, b});
+    conjunctions(r, columns, filters);
+    conjunctions(r, columns, {{4, Op::Equal, text.back(), std::string()},
+                              {0, Op::Equal, small.back(), int64_t(0)}});
+    const Predicate missing{0, Op::Equal, int64_t(999), int64_t(999)};
+    auto skipped = r.scan_all({filters[3], missing});
+    check(skipped.groups_read == 0 && skipped.groups_skipped == r.groups().size() &&
+          skipped.bytes_read == r.metadata_bytes(), "any AND zone can prune before any payload");
+    auto stopped = r.scan_all({missing, filters[3]}, false);
+    uint64_t first_bytes = r.metadata_bytes();
+    for (const auto& g : r.groups()) first_bytes += g[0].bytes;
+    check(stopped.matched == 0 && stopped.bytes_read == first_bytes, "empty selection avoids later columns");
+    const std::vector<Predicate> all{{0, Op::Between, int64_t(0), int64_t(30)},
+                                     {3, Op::Between, std::string(), std::string("zz")}};
+    uint64_t two_column_bytes = r.metadata_bytes();
+    for (const auto& g : r.groups()) two_column_bytes += g[0].bytes + g[3].bytes;
+    auto all_result = r.scan_all(all, false);
+    check(all_result.matched == n && all_result.bytes_read == two_column_bytes,
+          "AND reads exactly its predicate columns");
+    std::mt19937_64 rng(87291);
+    for (size_t trial = 0; trial < 40; ++trial) {
+        std::vector<Predicate> random;
+        for (size_t j = 0; j < 2 + trial % 5; ++j) {
+            const size_t c = rng() % columns.size();
+            auto at = [&](size_t row) { return std::visit([&](const auto& v) -> Value { return v[row]; }, columns[c]); };
+            auto low = at(rng() % n), high = at(rng() % n);
+            if (high < low) std::swap(low, high);
+            random.push_back({c, trial % 3 == 0 ? Op::Equal : Op::Between, low, high});
+        }
+        conjunctions(r, columns, random);
+    }
+    auto repeated = r.scan_all({filters[0], filters[0]}, false);
+    check(repeated.bytes_read == first_bytes, "repeated column read only once");
+    const std::vector<Predicate> incompatible{{0, Op::Equal, int64_t(3), int64_t(0)},
+                                             {0, Op::Equal, int64_t(4), int64_t(0)}};
+    conjunctions(r, columns, incompatible);
+    conjunctions(r, columns, {{0, Op::Between, int64_t(9), int64_t(2)}, filters[3]});
+    throws([&] { r.scan_all({missing, {99, Op::Equal, int64_t(0), int64_t(0)}}); },
+           "validate later column before pruning");
+    throws([&] { r.scan_all({missing, {1, Op::Between, int64_t(0), std::string()}}); },
+           "validate later bound type before pruning");
+    throws([&] { r.scan_all({missing, {1, static_cast<Op>(99), int64_t(0), int64_t(0)}}); },
+           "validate later operation before pruning");
+}
 void payload_corruption_tests(const Scratch& scratch) {
     auto corrupt_payload = [&](const std::string& name, Column column, Type type,
                                Encoding expected, const std::function<void(std::string&, const ChunkMeta&)>& mutate) {
         auto path = scratch.file(name);
-        write_file(path, {{"value", type}}, {column}, {8192, 256});
+        const auto n = std::visit([](const auto& values) { return values.size(); }, column);
+        write_file(path, {{"value", type}, {"guard", Type::Int64}},
+                   {column, std::vector<int64_t>(n, 0)}, {8192, 256});
         Reader before(path);
         auto meta = before.groups().at(0).at(0);
         check(meta.encoding == expected, "corruption fixture uses requested codec");
@@ -194,6 +311,9 @@ void payload_corruption_tests(const Scratch& scratch) {
         throws([&] { broken.read_column(0, 0); }, "malformed codec rejected on materialization");
         Value low = type == Type::Int64 ? Value(int64_t(0)) : Value(std::string("value"));
         throws([&] { broken.scan({0, Op::Equal, low, low}, false); }, "malformed codec rejected on unpruned scan");
+        throws([&] { broken.scan_all({{1, Op::Equal, int64_t(0), int64_t(0)},
+                                     {0, Op::Equal, low, low}}, false); },
+               "malformed codec rejected in AND selection path");
     };
     std::vector<int64_t> long_runs(4096, 0);
     std::fill(long_runs.begin() + 2048, long_runs.end(), 1);
@@ -248,6 +368,7 @@ int main() {
         encoding_tests(scratch);
         edge_tests(scratch);
         pruning_tests(scratch);
+        conjunction_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);
         std::cout << "PASS: " << checks << " checks (encodings, scalar oracle, edge cases, pruning, malformed files)\n";

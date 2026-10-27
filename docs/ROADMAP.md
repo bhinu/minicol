@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Add AND predicates and selection vectors, then projected aggregate scans; verify against a scalar oracle.
+1. Add projected aggregate scans using the internal AND selection vectors; verify against a scalar oracle and define integer overflow semantics.
 2. Strengthen bounded malformed-input tests and add a fuzz target; document exact resource limits.
 3. Add streaming row-group writes and bounded-memory readers for large inputs.
 4. Add file/chunk checksums with a format version bump and compatibility tests.
@@ -22,3 +22,36 @@ Every scheduled run should choose one bounded improvement, validate it, update t
 ## Cloud runner preparation — 2026-10-27
 
 Prepared hourly generation → isolated validation → publication workflow, pinned official actions, explicit author attribution to bhinu, bounded patch transport, and eight transport tests. Activation awaits workflow-upload permission and the OPENAI_API_KEY GitHub secret; do not call this live until the first cloud run succeeds. Existing local hourly automation remains available until cloud handoff is verified.
+
+## AND count scans — 2026-10-27
+
+- Added `Reader::scan_all` for typed AND predicates with internal, sorted,
+  group-local row selections. The existing `scan` delegates to the same engine;
+  format v1 is unchanged. Empty conjunctions count all rows from metadata.
+- Validate all predicates before pruning, combine repeated-column predicates in
+  one chunk read, check every predicate's zone map before payload reads, and stop
+  reading later columns when an intersection is empty. Dictionary entries and
+  RLE runs retain encoded predicate evaluation. Documented counters, validation
+  boundaries, predicate order, and row-group selection memory in FORMAT.md.
+- Release and ASan/UBSan suites pass 3,311 checks. Independent row-wise scalar
+  oracles cover every codec pair, deterministic randomized conjunctions (seed
+  87291), predicate reversal, duplicates, contradictory and reversed ranges,
+  empty tables/conjunctions, embedded NUL strings, integer extremes, batch/group
+  tails, exact column byte accounting, and malformed payloads in selection paths.
+- Checks: `make test`; `make sanitize` initially failed because LeakSanitizer
+  cannot run under this container's tracing environment;
+  `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed with address and undefined
+  behavior sanitizers active. Leak detection remains unverified here.
+- Benchmark regression smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke`. All five existing workloads and
+  three methods agreed with the row baseline. Retained all 15 raw trials in
+  [benchmark-smoke-2026-10-27.csv](benchmark-smoke-2026-10-27.csv), with compiler,
+  machine, flags, seed 42, row/trial counts, cache assumptions, logical byte
+  accounting, and limitations in
+  [the environment record](benchmark-smoke-2026-10-27-environment.txt).
+  This single-group smoke does not measure AND performance or establish a
+  performance claim; the earlier benchmark evidence remains unchanged.
+- Remaining: projected aggregates and their overflow contract; selection vectors
+  currently stay internal and each visited predicate chunk is decoded in full.
+  Workload-driven predicate ordering, AND benchmark workloads, fuzzing/resource
+  limits, and streaming readers/writers remain future work.

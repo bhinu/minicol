@@ -44,17 +44,21 @@ Encoded encode(const Column& col,size_t begin,uint32_t n,uint32_t sample,Value& 
  else if(!ints&&sampled.size()*2<=sn){std::unordered_map<std::string,uint32_t> ids;std::vector<std::string> dict;std::vector<uint32_t> codes;codes.reserve(n);for(uint32_t i=0;i<n;++i){const auto& s=std::get<1>(col)[begin+i];auto it=ids.find(s);if(it==ids.end()){auto id=uint32_t(dict.size());ids.emplace(s,id);dict.push_back(s);codes.push_back(id);}else codes.push_back(it->second);}Bytes b;put(b,dict.size(),4);for(auto& s:dict)str(b,s);for(auto id:codes)put(b,id,4);if(b.size()<best.bytes.size())best={Encoding::Dictionary,std::move(b)};}
  return best;
 }
+bool matches_all(const Value& v,const std::vector<const Predicate*>& predicates) {
+ for(const auto* p:predicates)if(!matches(v,*p))return false;
+ return true;
+}
 // Calls consume in batches; dictionary scans retain strings once per dictionary only.
-template<class Consume> void walk(const Bytes& b,Type type,const ChunkMeta& m,Consume consume,const Predicate* predicate=nullptr,uint64_t* direct=nullptr) {
+template<class Consume> void walk(const Bytes& b,Type type,const ChunkMeta& m,Consume consume,const std::vector<const Predicate*>* predicates=nullptr,uint64_t* direct=nullptr,std::vector<uint32_t>* selected=nullptr) {
  Cursor c{b};std::vector<std::string> dict;std::vector<uint8_t> dict_matches;
  int64_t base=0;unsigned bits=0;size_t packed=0;
- if(m.encoding==Encoding::Dictionary){if(type!=Type::String)bad("dictionary requires string type");auto count=c.get(4);if(count>m.rows||count>(b.size()-c.p)/4)bad("invalid dictionary size");dict.reserve(size_t(count));for(uint64_t i=0;i<count;++i)dict.push_back(c.string());if(b.size()-c.p!=uint64_t(m.rows)*4)bad("invalid dictionary codes size");if(predicate){for(auto& s:dict)dict_matches.push_back(matches(s,*predicate));}}
+ if(m.encoding==Encoding::Dictionary){if(type!=Type::String)bad("dictionary requires string type");auto count=c.get(4);if(count>m.rows||count>(b.size()-c.p)/4)bad("invalid dictionary size");dict.reserve(size_t(count));for(uint64_t i=0;i<count;++i)dict.push_back(c.string());if(b.size()-c.p!=uint64_t(m.rows)*4)bad("invalid dictionary codes size");if(predicates){for(auto& s:dict)dict_matches.push_back(matches_all(s,*predicates));}}
  if(m.encoding==Encoding::BitPacked){if(type!=Type::Int64)bad("bitpacking requires integer type");base=signed_bits(c.get(8));bits=unsigned(c.get(1));if(bits>64||b.size()-c.p!=(uint64_t(m.rows)*bits+7)/8)bad("invalid packed data");packed=c.p;}
- if(m.encoding==Encoding::RLE){uint32_t produced=0;while(produced<m.rows){auto count=c.get(4);auto v=value(c,type);if(!count||count>m.rows-produced)bad("invalid run length");if(predicate&&direct){if(matches(v,*predicate))*direct+=count;}else{for(uint64_t i=0;i<count;++i)consume(v);}produced+=uint32_t(count);}c.done();return;}
+ if(m.encoding==Encoding::RLE){uint32_t produced=0;while(produced<m.rows){auto count=c.get(4);auto v=value(c,type);if(!count||count>m.rows-produced)bad("invalid run length");if(predicates&&direct){if(matches_all(v,*predicates)){*direct+=count;if(selected)for(uint32_t i=0;i<count;++i)selected->push_back(produced+i);}}else{for(uint64_t i=0;i<count;++i)consume(v);}produced+=uint32_t(count);}c.done();return;}
  std::array<int64_t,1024> iv{};std::array<uint32_t,1024> ids{};std::array<std::string,1024> sv;
  for(uint32_t offset=0;offset<m.rows;){uint32_t n=std::min<uint32_t>(1024,m.rows-offset);
   for(uint32_t i=0;i<n;++i){if(m.encoding==Encoding::Dictionary){ids[i]=uint32_t(c.get(4));if(ids[i]>=dict.size())bad("invalid dictionary ID");}else if(m.encoding==Encoding::BitPacked)iv[i]=signed_bits(uint64_t(base)+unpack(b,packed,bits,uint64_t(offset+i)*bits));else if(type==Type::Int64)iv[i]=signed_bits(c.get(8));else sv[i]=c.string();}
-  for(uint32_t i=0;i<n;++i){if(m.encoding==Encoding::Dictionary){if(predicate&&direct)*direct+=dict_matches[ids[i]];else consume(Value(dict[ids[i]]));}else if(type==Type::Int64)consume(Value(iv[i]));else consume(Value(sv[i]));}offset+=n;
+  for(uint32_t i=0;i<n;++i){if(m.encoding==Encoding::Dictionary){if(predicates&&direct){*direct+=dict_matches[ids[i]];if(selected&&dict_matches[ids[i]])selected->push_back(offset+i);}else consume(Value(dict[ids[i]]));}else if(type==Type::Int64)consume(Value(iv[i]));else consume(Value(sv[i]));}offset+=n;
  }
  if(m.encoding!=Encoding::BitPacked)c.done();
 }
@@ -78,11 +82,67 @@ Reader::Reader(const std::string& path):path_(path) {
  c.done();if(expected_offset!=size-16-fl)bad("unexpected payload bytes");metadata_bytes_=32+fl;
 }
 Column Reader::read_column(size_t group,size_t column) const {
- if(group>=groups_.size()||column>=schema_.size())throw std::out_of_range("group/column");auto& m=groups_[group][column];std::ifstream in(path_,std::ios::binary);auto b=load(in,m.offset,m.bytes);Column result;if(schema_[column].type==Type::Int64)result=std::vector<int64_t>{};else result=std::vector<std::string>{};walk(b,schema_[column].type,m,[&](const Value& v){if(v.index()==0)std::get<0>(result).push_back(std::get<0>(v));else std::get<1>(result).push_back(std::get<1>(v));});return result;
+ if(group>=groups_.size()||column>=schema_.size())throw std::out_of_range("group/column");
+ auto& m=groups_[group][column];std::ifstream in(path_,std::ios::binary);auto b=load(in,m.offset,m.bytes);Column result;if(schema_[column].type==Type::Int64)result=std::vector<int64_t>{};else result=std::vector<std::string>{};walk(b,schema_[column].type,m,[&](const Value& v){if(v.index()==0)std::get<0>(result).push_back(std::get<0>(v));else std::get<1>(result).push_back(std::get<1>(v));});return result;
 }
 ScanResult Reader::scan(const Predicate& p,bool zones) const {
- if(p.column>=schema_.size())throw std::out_of_range("predicate column");if(p.op!=Op::Equal&&p.op!=Op::Between)bad("invalid predicate operation");size_t ty=size_t(schema_[p.column].type);if(p.low.index()!=ty||(p.op==Op::Between&&p.high.index()!=ty))bad("predicate type mismatch");ScanResult result;result.bytes_read=metadata_bytes_;std::ifstream in(path_,std::ios::binary);
- for(auto& group:groups_){auto& m=group[p.column];bool skip=p.op==Op::Equal?(less(p.low,m.min)||less(m.max,p.low)):(less(p.high,m.min)||less(m.max,p.low)||less(p.high,p.low));if(zones&&skip){++result.groups_skipped;continue;}auto b=load(in,m.offset,m.bytes);result.bytes_read+=m.bytes;++result.groups_read;result.batches+=(uint64_t(m.rows)+1023)/1024;walk(b,schema_[p.column].type,m,[&](const Value& v){result.matched+=matches(v,p);},&p,&result.matched);}
+ return scan_all({p},zones);
+}
+ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones) const {
+ // Validate every predicate before pruning or short-circuiting any payload reads.
+ std::vector<size_t> columns;
+ std::vector<std::vector<const Predicate*>> by_column;
+ for(const auto& p:predicates){
+  if(p.column>=schema_.size())throw std::out_of_range("predicate column");
+  if(p.op!=Op::Equal&&p.op!=Op::Between)bad("invalid predicate operation");
+  size_t ty=size_t(schema_[p.column].type);
+  if(p.low.index()!=ty||(p.op==Op::Between&&p.high.index()!=ty))bad("predicate type mismatch");
+  auto it=std::find(columns.begin(),columns.end(),p.column);
+  if(it==columns.end()){columns.push_back(p.column);by_column.push_back({&p});}
+  else by_column[size_t(it-columns.begin())].push_back(&p);
+ }
+ ScanResult result;result.bytes_read=metadata_bytes_;
+ if(predicates.empty()){result.matched=rows_;return result;}
+ std::ifstream in(path_,std::ios::binary);
+ for(const auto& group:groups_){
+  bool skip=false;
+  if(zones)for(const auto& p:predicates){
+   const auto& m=group[p.column];
+   skip=p.op==Op::Equal?(less(p.low,m.min)||less(m.max,p.low)):
+       (less(p.high,m.min)||less(m.max,p.low)||less(p.high,p.low));
+   if(skip)break;
+  }
+  if(skip){++result.groups_skipped;continue;}
+  ++result.groups_read;result.batches+=(uint64_t(group.front().rows)+1023)/1024;
+  std::vector<uint32_t> selection;
+  for(size_t ci=0;ci<columns.size();++ci){
+   const auto column=columns[ci];const auto& m=group[column];
+   auto b=load(in,m.offset,m.bytes);result.bytes_read+=m.bytes;
+   uint64_t matched=0;uint32_t row=0;
+   // Single-column counts keep the encoded count fast path and need no selection.
+   if(columns.size()==1){
+    walk(b,schema_[column].type,m,[&](const Value& v){matched+=matches_all(v,by_column[ci]);},&by_column[ci],&matched);
+    result.matched+=matched;break;
+   }
+   std::vector<uint32_t> hits;
+   walk(b,schema_[column].type,m,[&](const Value& v){
+    if(matches_all(v,by_column[ci]))hits.push_back(row);
+    ++row;
+   },&by_column[ci],&matched,&hits);
+   if(ci==0)selection=std::move(hits);
+   else {
+    // Both vectors are sorted group-local row offsets. Compact in place.
+    size_t out=0,j=0;
+    for(auto selected:selection){
+     while(j<hits.size()&&hits[j]<selected)++j;
+     if(j<hits.size()&&hits[j]==selected)selection[out++]=selected;
+    }
+    selection.resize(out);
+   }
+   if(selection.empty())break;
+  }
+  if(columns.size()>1)result.matched+=selection.size();
+ }
  return result;
 }
 } // namespace minicol
