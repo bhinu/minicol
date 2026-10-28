@@ -138,3 +138,53 @@ once even when its selection is empty. An unfiltered sum visits every group and
 reads only the projected column; an empty table visits no groups. Memory includes
 row-group selections, decoder allocations, and one retained encoded projected
 chunk in addition to the currently loaded predicate chunk.
+
+## Resource limits and fuzzing
+
+`Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows})`
+accepts optional, inclusive limits. It rejects an oversized footer before loading
+its bytes, an oversized encoded chunk while parsing metadata (even if a later
+scan would prune it), and oversized actual row groups before constructing schema
+or group objects. The row limit applies to the largest actual group, not the
+header's target size; an empty table satisfies a zero row/chunk limit. A zero
+footer limit rejects every file. Limit violations throw `std::runtime_error`.
+Limits do not alter persisted bytes or require a format-v1 version bump.
+
+Defaults are `UINT64_MAX`, `UINT64_MAX`, and `UINT32_MAX`: existing callers retain
+all format-v1 dimensions, subject to file-bound checks, address space, stream
+limits, and available resources. No small input or process-memory budget is
+imposed by default. Callers handling untrusted files should choose explicit
+limits; for example `{1048576, 16777216, 65536}` caps the footer at 1 MiB, each
+encoded chunk at 16 MiB, and each actual group at 65,536 rows. These are input
+dimension caps, not an exact allocation or runtime budget. Metadata allocations
+include all schema/group objects and copied strings in addition to the footer
+buffer. Dictionary and RLE strings can expand on materialization; decoded string
+storage can scale with group rows times encoded chunk bytes. Count/sum scans can
+visit all groups, and there is no total-row, total-file, or elapsed-time cap.
+The reader still validates payloads only when loaded and assumes immutable files.
+
+`make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the
+engine and regular tests still need only dependency-free C++17. `FUZZ_CXX` can
+select a compatible compiler. The target generates nine seed files in
+`build/fuzz-corpus` covering every codec/type combination, zero-width packing,
+empty tables, multiple columns, group tails, NUL strings, and signed extremes.
+It runs 1,000 inputs with seed 42 and a five-second per-input timeout. Corpus
+and failure artifacts stay under `build/`; no binary corpus is checked in.
+For a longer run after building:
+
+```sh
+./build/fuzz_reader build/fuzz-corpus -seed=42 -runs=100000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts/
+```
+
+The harness caps input at 65,536 bytes, footer/chunk bytes at 4,096 each, and
+actual group rows at 64. After metadata validation it exercises payloads only
+for tables with at most 256 total rows and four columns. Expected parse/decode
+errors are rejected inputs; allocation failures and sanitizer errors remain
+failures. Accepted payloads are materialized and checked against independent
+row-wise scalar count/AND/sum oracles, including modulo-2^64 sums. Unpruned scans
+are always checked. Pruned scans are checked only when decoded values fit every
+persisted zone bound: format v1 cannot detect arbitrary false bounds. The smoke
+is bounded coverage, not proof of malformed-input safety or a memory budget.
+If LeakSanitizer cannot run under a tracing environment, use
+`ASAN_OPTIONS=detect_leaks=0 make fuzz` (and the same prefix for `make sanitize`);
+address and undefined-behavior checks remain enabled, but leaks are unverified.

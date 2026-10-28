@@ -9,6 +9,8 @@ Requires a C++17 compiler and Make; Python 3 is optional for reporting.
 ```sh
 make test
 make sanitize
+# Optional: Clang with libFuzzer, ASan, and UBSan runtimes
+make fuzz
 make build/benchmark
 ./build/benchmark 1000000 7 build/data > docs/benchmark-raw.csv 2> docs/benchmark-environment.txt
 python3 bench/summarize.py docs/benchmark-raw.csv
@@ -45,6 +47,13 @@ auto total = reader.sum_int64(0, {
 ```
 
 Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
+
+For untrusted files, opt into input limits, for example
+`Reader reader("example.mcol", ReadLimits{1048576, 16777216, 65536});`.
+These cap footer bytes, encoded bytes per chunk, and actual rows per group,
+respectively. Defaults retain all format-v1 dimensions. See
+[resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
+validation boundaries and memory limitations.
 
 ## Evidence and boundaries
 

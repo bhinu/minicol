@@ -15,10 +15,16 @@ struct ChunkMeta { uint64_t offset=0, bytes=0; uint32_t rows=0; Encoding encodin
 struct ScanResult { uint64_t matched=0, bytes_read=0, groups_read=0, groups_skipped=0, batches=0; };
 struct SumResult { ScanResult scan; int64_t sum=0; };
 struct WriteOptions { uint32_t row_group_size=65536; uint32_t sample_size=2048; };
+// Opt-in input limits; defaults preserve support for all format-v1 dimensions.
+struct ReadLimits {
+ uint64_t max_footer_bytes=UINT64_MAX;
+ uint64_t max_chunk_bytes=UINT64_MAX;
+ uint32_t max_group_rows=UINT32_MAX;
+};
 void write_file(const std::string& path, const std::vector<Field>& schema, const std::vector<Column>& columns, WriteOptions options={});
 class Reader {
 public:
- explicit Reader(const std::string& path);
+ explicit Reader(const std::string& path, ReadLimits limits={});
  const std::vector<Field>& schema() const { return schema_; }
  const std::vector<std::vector<ChunkMeta>>& groups() const { return groups_; }
  uint64_t rows() const { return rows_; }

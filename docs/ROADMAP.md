@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Strengthen bounded malformed-input tests and add a fuzz target; document exact resource limits.
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and decoded-string/total-work budgets (initial caps and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -94,3 +94,47 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   remain future work. Summation currently decodes the full projected chunk and
   redecodes it when shared with predicates; RLE sums expand values in the scalar
   consumer. Optimizing those paths requires profiling and retained measurements.
+
+## Bounded input limits and fuzzing — 2026-10-28
+
+- Added opt-in `ReadLimits` to `Reader`: inclusive footer-byte, encoded
+  chunk-byte, and actual group-row caps. Reject oversized footers before loading,
+  oversized groups before schema/group allocation, and oversized chunks during
+  metadata validation, including chunks that scans might prune. Default limits
+  preserve all format-v1 dimensions and existing API calls; persisted format and
+  dependencies are unchanged. Documented exact boundaries, default behavior,
+  string-expansion costs, and the absence of total-memory/time budgets.
+- Release suite passes 5,842 checks. Added exact-boundary and one-below-limit
+  cases, zero limits, empty/short groups with large header target sizes, all
+  codecs with independent scalar count/AND/sum oracles, every truncated prefix
+  of an independently constructed packed file, oversized footer dimensions, and
+  tiny RLE/zero-width packed files advertising `UINT32_MAX` rows. The latter are
+  accepted as metadata under defaults and rejected before decoding with caps.
+- Added optional `make fuzz` using Clang/libFuzzer with ASan/UBSan. Nine generated
+  seeds exercise every codec/type combination, signed extremes, zero-width
+  packing, NUL strings, multi-column groups, tails, and empty tables. The harness
+  caps file/footer/chunk/group dimensions and post-parse row/column counts;
+  accepted payloads are compared with independent materialized row-wise scalar
+  count/AND/wrapping-sum oracles. Pruning checks require bounds containing actual
+  decoded values because v1 has no integrity checks. Corpus/artifacts stay in
+  `build/`; no binary assets are added. See FORMAT.md for limits and longer runs.
+- Checks: `make test` passed. `make sanitize` and the initial `make fuzz` reached
+  this container's known LeakSanitizer fatal error under ptrace. Reruns with
+  `ASAN_OPTIONS=detect_leaks=0 make sanitize` and
+  `ASAN_OPTIONS=detect_leaks=0 make fuzz` passed with ASan/UBSan enabled;
+  leak detection remains unverified here. Fuzz smoke used Clang 18.1.3, seed 42,
+  1,000 runs, max input 65,536 bytes, and five-second per-input timeout. This is
+  bounded smoke coverage, not an exhaustive safety claim.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-input-limits-2026-10-28`.
+  All five workloads and three methods agreed with the row baseline. Preserved
+  earlier evidence and retained all 15 new trials in
+  [raw CSV](benchmark-smoke-input-limits-2026-10-28.csv), with command, compiler,
+  machine, seed, row/trial counts, cache assumptions, logical-byte accounting,
+  and limitations in the [environment record](benchmark-smoke-input-limits-2026-10-28-environment.txt).
+  No performance claim is made.
+- Remaining: longer fuzz campaigns and regression cases for any findings;
+  stricter decoded-string/total-memory and total-work budgets; streaming writes
+  and bounded-memory reads. Limits are opt-in and are input dimensions rather
+  than a process-memory guarantee. Checksums with a version bump, expanded
+  benchmarks, and profiled hot-loop improvements remain later roadmap items.

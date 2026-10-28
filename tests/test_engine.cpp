@@ -424,6 +424,133 @@ void aggregate_tests(const Scratch& scratch) {
     throws([&] { r.sum_int64(0, {missing, {0, static_cast<Op>(99), int64_t(0), int64_t(0)}}); },
            "validate aggregate predicate operation before pruning");
 }
+// Build minimal v1 files independently of the writer for dimension attacks.
+void append_le(std::string& bytes, uint64_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i) bytes.push_back(char(value >> (8 * i)));
+}
+std::string dimension_fixture(uint32_t rows, Encoding encoding, const std::string& payload) {
+    std::string bytes = "MINICOL1";
+    append_le(bytes, 1, 4);
+    append_le(bytes, rows, 4);
+    bytes += payload;
+    std::string footer;
+    append_le(footer, rows, 8);
+    append_le(footer, 1, 4); // one int64 column
+    append_le(footer, 1, 4); // one group
+    append_le(footer, 1, 4);
+    footer += 'v';
+    footer += char(Type::Int64);
+    append_le(footer, rows, 4);
+    footer += char(encoding);
+    append_le(footer, 16, 8);
+    append_le(footer, payload.size(), 8);
+    append_le(footer, 0, 8);
+    append_le(footer, 0, 8);
+    bytes += footer;
+    append_le(bytes, footer.size(), 8);
+    bytes += "MCOLEND1";
+    return bytes;
+}
+void bounded_input_tests(const Scratch& scratch) {
+    const auto path = scratch.file("bounded.mc");
+    const auto lo = std::numeric_limits<int64_t>::min();
+    const auto hi = std::numeric_limits<int64_t>::max();
+    std::vector<int64_t> plain(513), packed(513), runs(513);
+    std::vector<std::string> text(513), dict(513), text_runs(513);
+    for (size_t i = 0; i < plain.size(); ++i) {
+        plain[i] = i % 2 ? hi : lo;
+        packed[i] = int64_t(i % 31);
+        runs[i] = (i / 128) % 2 ? hi : lo;
+        text[i] = "unique-" + std::to_string(i);
+        dict[i] = "long-dictionary-entry-" + std::to_string(i % 3);
+        text_runs[i] = std::string(40, char('a' + i / 128));
+    }
+    const std::vector<Column> columns{plain, packed, runs, text, dict, text_runs};
+    write_file(path, {{"plain", Type::Int64}, {"packed", Type::Int64}, {"runs", Type::Int64},
+                      {"text", Type::String}, {"dict", Type::String}, {"text_runs", Type::String}},
+               columns, {256, 256});
+    Reader unrestricted(path);
+    const std::vector<Encoding> expected{Encoding::Plain, Encoding::BitPacked, Encoding::RLE,
+                                          Encoding::Plain, Encoding::Dictionary, Encoding::RLE};
+    uint64_t chunk_limit = 0;
+    for (const auto& group : unrestricted.groups())
+        for (const auto& m : group) chunk_limit = std::max(chunk_limit, m.bytes);
+    const ReadLimits limits{unrestricted.metadata_bytes() - 32, chunk_limit, 256};
+    Reader bounded(path, limits);
+    for (size_t c = 0; c < columns.size(); ++c) {
+        check(bounded.groups()[0][c].encoding == expected[c], "bounded fixture codec");
+        for (size_t g = 0; g < bounded.groups().size(); ++g) {
+            const auto begin = g * 256, end = std::min(begin + 256, plain.size());
+            const Column wanted = std::visit([&](const auto& v) -> Column {
+                using Vec = std::decay_t<decltype(v)>;
+                return Vec(v.begin() + begin, v.begin() + end);
+            }, columns[c]);
+            check(bounded.read_column(g, c) == wanted, "bounded decoding matches source values");
+        }
+    }
+    const std::vector<Predicate> filters{{0, Op::Equal, hi, lo},
+                                         {4, Op::Equal, dict[1], std::string()}};
+    scans(bounded, columns, filters);
+    conjunctions(bounded, columns, filters);
+    conjunctions(bounded, columns, {});
+    auto expect_limit = [&](ReadLimits cap, const std::string& message) {
+        bool rejected = false;
+        try { Reader r(path, cap); }
+        catch (const std::runtime_error& e) { rejected = e.what() == message; }
+        check(rejected, "expected resource rejection: " + message);
+    };
+    expect_limit({limits.max_footer_bytes - 1, chunk_limit, 256}, "footer byte limit exceeded");
+    expect_limit({limits.max_footer_bytes, chunk_limit - 1, 256}, "chunk byte limit exceeded");
+    expect_limit({limits.max_footer_bytes, chunk_limit, 255}, "group row limit exceeded");
+    expect_limit({0, UINT64_MAX, UINT32_MAX}, "footer byte limit exceeded");
+    expect_limit({UINT64_MAX, 0, UINT32_MAX}, "chunk byte limit exceeded");
+    expect_limit({UINT64_MAX, UINT64_MAX, 0}, "group row limit exceeded");
+
+    // The cap applies to actual group rows, including short final and empty groups.
+    write_file(path, {{"v", Type::Int64}}, {std::vector<int64_t>{7}}, {UINT32_MAX, 1});
+    Reader short_group(path, {1024, 8, 1});
+    check(short_group.sum_int64(0).sum == 7, "large target size with bounded actual rows");
+    write_file(path, {{"v", Type::Int64}}, {std::vector<int64_t>{}}, {UINT32_MAX, 1});
+    Reader empty(path, {1024, 0, 0});
+    check(empty.scan_all({}).matched == 0, "zero row/chunk limits allow empty tables");
+
+    auto save = [&](const std::string& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) throw std::runtime_error("fixture write failed");
+    };
+    // Tiny, structurally valid chunks can advertise billions of decoded rows.
+    std::string packed_zero(9, char(0)), huge_run;
+    append_le(huge_run, UINT32_MAX, 4);
+    append_le(huge_run, 0, 8);
+    for (const auto& fixture : {dimension_fixture(UINT32_MAX, Encoding::BitPacked, packed_zero),
+                                dimension_fixture(UINT32_MAX, Encoding::RLE, huge_run)}) {
+        save(fixture);
+        check(Reader(path).rows() == UINT32_MAX, "default permits v1 compressed dimensions");
+        expect_limit({1024, 1024, 64}, "group row limit exceeded");
+    }
+    const auto valid = dimension_fixture(1, Encoding::BitPacked, packed_zero);
+    save(valid);
+    check(Reader(path, {1024, 9, 1}).read_column(0, 0) == Column(std::vector<int64_t>{0}),
+          "independently built zero-width packed fixture");
+    for (size_t size = 0; size < valid.size(); ++size) {
+        save(valid.substr(0, size));
+        throws([&] { Reader r(path, {1024, 1024, 64}); }, "every truncated prefix is rejected");
+    }
+    // Footer dimensions and lengths must fail without trusting attacker allocations.
+    auto overwrite = [](std::string& bytes, size_t at, uint64_t value, unsigned width) {
+        for (unsigned i = 0; i < width; ++i) bytes.at(at + i) = char(value >> (8 * i));
+    };
+    const size_t footer = 16 + packed_zero.size();
+    for (const auto& mutation : std::vector<std::pair<size_t, unsigned>>{
+             {valid.size() - 16, 8}, {footer, 8}, {footer + 8, 4}, {footer + 12, 4},
+             {footer + 16, 4}, {footer + 22 + 13, 8}}) {
+        auto broken = valid;
+        overwrite(broken, mutation.first, UINT64_MAX, mutation.second);
+        save(broken);
+        throws([&] { Reader r(path, {1024, 1024, 64}); }, "oversized footer dimension rejected");
+    }
+}
 void invalid_tests(const Scratch& scratch) {
     const auto path = scratch.file("invalid.mc");
     throws([&] { write_file(path, {{"i", Type::Int64}}, {std::vector<int64_t>{1}}, {0, 1}); }, "reject zero row-group size");
@@ -462,6 +589,7 @@ int main() {
         pruning_tests(scratch);
         conjunction_tests(scratch);
         aggregate_tests(scratch);
+        bounded_input_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);
         std::cout << "PASS: " << checks << " checks (encodings, scalar oracle, edge cases, pruning, malformed files)\n";
