@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and decoded-string/total-work budgets (initial caps and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input caps, decoded-string caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -138,3 +138,51 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   and bounded-memory reads. Limits are opt-in and are input dimensions rather
   than a process-memory guarantee. Checksums with a version bump, expanded
   benchmarks, and profiled hot-loop improvements remain later roadmap items.
+
+## Decoded-string chunk budgets — 2026-10-28
+
+- Added opt-in `ReadLimits::max_decoded_string_bytes`, an inclusive sum of
+  string lengths over every row in each loaded chunk. Plain lengths, repeated
+  dictionary references, and RLE expansion count equally, including NUL bytes.
+  Default and existing three-field initializers remain unlimited; format v1 and
+  dependencies are unchanged. README.md and FORMAT.md describe the API,
+  validation timing, scope, and memory limitations.
+- Finite budgets preflight loaded string payloads before string construction or
+  expansion, using overflow-safe accounting and dictionary length metadata.
+  Materialization, count/AND scans, and projected-sum predicate scans enforce the
+  same limit. Pruning and early termination still avoid unused chunks. Budgets
+  reset per chunk/operation and do not affect integer chunks. Finite caps add a
+  parsing pass; this is a logical content bound, not a process-memory guarantee.
+- Release suite passes 6,027 checks. Independent source/scalar oracles cover all
+  string codecs, exact and one-below bounds, variable-length dictionary strings,
+  embedded NULs, zero-byte empty strings, repeated calls, batch/group tails,
+  pruning, AND/sum predicates, and unchanged integer results. An independently
+  constructed tiny RLE file represents `UINT32_MAX` three-byte strings: an exact
+  64-bit budget permits an encoded count, while one below rejects before
+  materialization. Malformed payload tests now run with unlimited and finite
+  caps, including invalid IDs, truncated strings, and invalid string runs.
+- Checks: `make test` passed in the release build (`-O3 -DNDEBUG`).
+  `make sanitize` hit the documented LeakSanitizer fatal error under ptrace;
+  `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all 6,027 checks with
+  address and undefined-behavior sanitizers enabled. Leak detection remains
+  unverified in this environment. `git diff --check` passed.
+- The fuzz harness now caps decoded string content at 8,192 bytes per chunk.
+  `ASAN_OPTIONS=detect_leaks=0 make fuzz` passed 1,000 runs with seed 42,
+  Clang 18.1.3, max input 65,536 bytes, and five-second per-input timeout.
+  Initial `make fuzz` completed its inputs but hit the documented LeakSanitizer
+  fatal error under ptrace at exit; leak detection remains unverified.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-string-budget-2026-10-28`.
+  All five workloads and three methods agreed with the row-store baseline.
+  Preserved earlier evidence and retained all 15 trials in
+  [raw CSV](benchmark-smoke-string-budget-2026-10-28.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-string-budget-2026-10-28-environment.txt).
+  The benchmark uses unlimited defaults; no configured-cap performance claim
+  is made.
+- Remaining: total-query work limits, full allocation accounting (including
+  metadata, unused dictionary entries, string objects/copies, and caller-retained
+  columns), longer fuzz campaigns and regression cases for findings. Streaming
+  writes and bounded-memory readers remain the next larger feature; checksums,
+  expanded benchmarks, and profiling remain later roadmap items.

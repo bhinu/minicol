@@ -20,6 +20,8 @@ struct ReadLimits {
  uint64_t max_footer_bytes=UINT64_MAX;
  uint64_t max_chunk_bytes=UINT64_MAX;
  uint32_t max_group_rows=UINT32_MAX;
+ // Sum of string lengths over all rows of each loaded string chunk.
+ uint64_t max_decoded_string_bytes=UINT64_MAX;
 };
 void write_file(const std::string& path, const std::vector<Field>& schema, const std::vector<Column>& columns, WriteOptions options={});
 class Reader {
@@ -40,6 +42,7 @@ private:
  std::vector<Field> schema_;
  std::vector<std::vector<ChunkMeta>> groups_;
  uint64_t rows_=0, metadata_bytes_=0;
+ uint64_t max_decoded_string_bytes_=UINT64_MAX;
 };
 const char* encoding_name(Encoding encoding);
 }

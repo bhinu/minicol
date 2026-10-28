@@ -333,29 +333,34 @@ void payload_corruption_tests(const Scratch& scratch) {
         in.close();
         mutate(bytes, meta);
         { std::ofstream out(path, std::ios::binary); out.write(bytes.data(), std::streamsize(bytes.size())); }
-        Reader broken(path);
-        throws([&] { broken.read_column(0, 0); }, "malformed codec rejected on materialization");
-        Value low = type == Type::Int64 ? Value(int64_t(0)) : Value(std::string("value"));
-        throws([&] { broken.scan({0, Op::Equal, low, low}, false); }, "malformed codec rejected on unpruned scan");
-        throws([&] { broken.scan_all({{1, Op::Equal, int64_t(0), int64_t(0)},
-                                     {0, Op::Equal, low, low}}, false); },
-               "malformed codec rejected in AND selection path");
-        const Predicate guard{1, Op::Equal, int64_t(0), int64_t(0)};
-        if (type == Type::Int64)
-            throws([&] { broken.sum_int64(0, {guard}, false); },
-                   "malformed projected integer payload rejected");
-        throws([&] { broken.sum_int64(1, {{0, Op::Equal, low, low}}, false); },
-               "malformed aggregate predicate payload rejected");
-        const Predicate absent{1, Op::Equal, int64_t(1), int64_t(1)};
-        for (bool zones : {false, true}) {
-            const auto empty = broken.sum_int64(type == Type::Int64 ? 0 : 1, {absent}, zones);
-            check(empty.sum == 0 && empty.scan.matched == 0,
-                  "empty aggregate avoids malformed unused payload");
+        for (uint64_t cap : {UINT64_MAX, UINT64_MAX - 1}) {
+            Reader broken(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, cap});
+            throws([&] { broken.read_column(0, 0); }, "malformed codec rejected on materialization");
+            Value low = type == Type::Int64 ? Value(int64_t(0)) : Value(std::string("value"));
+            throws([&] { broken.scan({0, Op::Equal, low, low}, false); }, "malformed codec rejected on unpruned scan");
+            throws([&] { broken.scan_all({{1, Op::Equal, int64_t(0), int64_t(0)},
+                                         {0, Op::Equal, low, low}}, false); },
+                   "malformed codec rejected in AND selection path");
+            const Predicate guard{1, Op::Equal, int64_t(0), int64_t(0)};
+            if (type == Type::Int64)
+                throws([&] { broken.sum_int64(0, {guard}, false); },
+                       "malformed projected integer payload rejected");
+            throws([&] { broken.sum_int64(1, {{0, Op::Equal, low, low}}, false); },
+                   "malformed aggregate predicate payload rejected");
+            const Predicate absent{1, Op::Equal, int64_t(1), int64_t(1)};
+            for (bool zones : {false, true}) {
+                const auto empty = broken.sum_int64(type == Type::Int64 ? 0 : 1, {absent}, zones);
+                check(empty.sum == 0 && empty.scan.matched == 0,
+                      "empty aggregate avoids malformed unused payload");
+            }
         }
     };
     std::vector<int64_t> long_runs(4096, 0);
     std::fill(long_runs.begin() + 2048, long_runs.end(), 1);
     corrupt_payload("bad-run.mc", long_runs, Type::Int64, Encoding::RLE,
+                    [](auto& b, const auto& m) { for (size_t i = 0; i < 4; ++i) b[m.offset + i] = 0; });
+    corrupt_payload("bad-string-run.mc", std::vector<std::string>(4096, "run-value"),
+                    Type::String, Encoding::RLE,
                     [](auto& b, const auto& m) { for (size_t i = 0; i < 4; ++i) b[m.offset + i] = 0; });
     std::vector<int64_t> small(4096);
     for (size_t i = 0; i < small.size(); ++i) small[i] = int64_t(i % 31);
@@ -551,6 +556,100 @@ void bounded_input_tests(const Scratch& scratch) {
         throws([&] { Reader r(path, {1024, 1024, 64}); }, "oversized footer dimension rejected");
     }
 }
+void decoded_string_budget_tests(const Scratch& scratch) {
+    const auto path = scratch.file("string-budget.mc");
+    for (Encoding codec : {Encoding::Plain, Encoding::Dictionary, Encoding::RLE}) {
+        std::vector<std::string> text(2051);
+        std::vector<int64_t> numbers(text.size(), 7);
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (codec == Encoding::Plain) text[i] = "unique-" + std::to_string(i);
+            else if (codec == Encoding::Dictionary)
+                text[i] = std::string("long-label\0", 11) + std::string((i % 3) * 7, 'x');
+            else text[i] = std::string(40, char('a' + i / 512));
+        }
+        const std::vector<Column> columns{numbers, text};
+        write_file(path, {{"i", Type::Int64}, {"s", Type::String}}, columns, {1025, 1025});
+        Reader original(path);
+        uint64_t largest = 0;
+        for (size_t g = 0; g < original.groups().size(); ++g) {
+            if (g == 0) check(original.groups()[g][1].encoding == codec, "string budget fixture codec");
+            const size_t begin = g * 1025, end = std::min(begin + 1025, text.size());
+            uint64_t bytes = 0;
+            for (size_t i = begin; i < end; ++i) bytes += text[i].size();
+            largest = std::max(largest, bytes);
+            Reader exact(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, bytes});
+            check(exact.read_column(g, 1) == Column(std::vector<std::string>(
+                      text.begin() + begin, text.begin() + end)), "exact string budget roundtrip");
+            Reader below(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, bytes - 1});
+            bool rejected = false;
+            try { below.read_column(g, 1); }
+            catch (const std::runtime_error& e) {
+                rejected = std::string(e.what()) == "decoded string byte limit exceeded";
+            }
+            check(rejected, "one byte below decoded string total rejects");
+        }
+        Reader exact(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, largest});
+        const Predicate text_filter{1, Op::Equal, text[1], std::string()};
+        scans(exact, columns, {text_filter});
+        conjunctions(exact, columns, {{0, Op::Equal, int64_t(7), int64_t(0)}, text_filter});
+        Reader zero(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, 0});
+        for (bool zones : {false, true}) {
+            throws([&] { zero.scan(text_filter, zones); }, "encoded scan enforces string budget");
+            throws([&] { zero.sum_int64(0, {text_filter}, zones); }, "sum predicate enforces string budget");
+            check(zero.scan_all({{0, Op::Equal, int64_t(99), int64_t(0)}, text_filter}, zones).matched == 0,
+                  "pruning and empty selections avoid oversized string chunks");
+        }
+        check(zero.scan_all({}).matched == text.size(), "metadata-only scan avoids string budget");
+        check(zero.sum_int64(0).sum == int64_t(7 * text.size()), "string cap does not affect integer chunks");
+        throws([&] { exact.scan_all({{99, Op::Equal, int64_t(0), int64_t(0)}, text_filter}); },
+               "predicate validation still precedes string budget checks");
+    }
+    // Independently construct a tiny RLE chunk whose expanded size exceeds 32 bits.
+    std::string payload;
+    append_le(payload, UINT32_MAX, 4);
+    append_le(payload, 3, 4);
+    payload += "abc";
+    std::string fixture = "MINICOL1";
+    append_le(fixture, 1, 4);
+    append_le(fixture, UINT32_MAX, 4);
+    fixture += payload;
+    std::string footer;
+    append_le(footer, UINT32_MAX, 8);
+    append_le(footer, 1, 4);
+    append_le(footer, 1, 4);
+    append_le(footer, 1, 4);
+    footer += 's';
+    footer += char(Type::String);
+    append_le(footer, UINT32_MAX, 4);
+    footer += char(Encoding::RLE);
+    append_le(footer, 16, 8);
+    append_le(footer, payload.size(), 8);
+    for (int bound = 0; bound < 2; ++bound) {
+        append_le(footer, 3, 4);
+        footer += "abc";
+    }
+    fixture += footer;
+    append_le(fixture, footer.size(), 8);
+    fixture += "MCOLEND1";
+    { std::ofstream out(path, std::ios::binary); out.write(fixture.data(), std::streamsize(fixture.size())); }
+    const uint64_t expanded = uint64_t(UINT32_MAX) * 3;
+    Reader huge_exact(path, {1024, 1024, UINT32_MAX, expanded});
+    const Predicate all{0, Op::Equal, std::string("abc"), std::string()};
+    check(huge_exact.scan(all).matched == UINT32_MAX, "64-bit expanded byte count without expanding RLE");
+    Reader huge_below(path, {1024, 1024, UINT32_MAX, expanded - 1});
+    throws([&] { huge_below.read_column(0, 0); }, "huge RLE rejected before materialization");
+    throws([&] { huge_below.scan(all, false); }, "64-bit budget one below run expansion rejects");
+    // Empty strings consume no decoded bytes; the budget resets for each call.
+    for (uint32_t n : {1u, 2049u}) {
+        write_file(path, {{"s", Type::String}}, {std::vector<std::string>(n)}, {1025, 1025});
+        Reader zero(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, 0});
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            check(zero.read_column(0, 0) == Column(std::vector<std::string>(std::min(n, 1025u))),
+                  "zero budget accepts empty strings");
+            scans(zero, {std::vector<std::string>(n)}, {{0, Op::Equal, std::string(), std::string()}});
+        }
+    }
+}
 void invalid_tests(const Scratch& scratch) {
     const auto path = scratch.file("invalid.mc");
     throws([&] { write_file(path, {{"i", Type::Int64}}, {std::vector<int64_t>{1}}, {0, 1}); }, "reject zero row-group size");
@@ -590,6 +689,7 @@ int main() {
         conjunction_tests(scratch);
         aggregate_tests(scratch);
         bounded_input_tests(scratch);
+        decoded_string_budget_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);
         std::cout << "PASS: " << checks << " checks (encodings, scalar oracle, edge cases, pruning, malformed files)\n";

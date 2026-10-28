@@ -49,9 +49,10 @@ auto total = reader.sum_int64(0, {
 Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
 
 For untrusted files, opt into input limits, for example
-`Reader reader("example.mcol", ReadLimits{1048576, 16777216, 65536});`.
-These cap footer bytes, encoded bytes per chunk, and actual rows per group,
-respectively. Defaults retain all format-v1 dimensions. See
+`Reader reader("example.mcol", ReadLimits{1048576, 16777216, 65536, 16777216});`.
+These cap footer bytes, encoded bytes per chunk, actual rows per group, and
+decoded string bytes per loaded chunk, respectively. Defaults retain all format-v1
+dimensions. See
 [resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
 validation boundaries and memory limitations.
 

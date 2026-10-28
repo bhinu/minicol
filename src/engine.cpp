@@ -24,6 +24,31 @@ Value value(Cursor& c,Type t) { if(t==Type::Int64)return signed_bits(c.get(8));r
 bool less(const Value& a,const Value& b) { return a.index()==0?std::get<int64_t>(a)<std::get<int64_t>(b):std::get<std::string>(a)<std::get<std::string>(b); }
 bool matches(const Value& v,const Predicate& p) { return p.op==Op::Equal?v==p.low:!less(v,p.low)&&!less(p.high,v); }
 Bytes load(std::ifstream& in,uint64_t off,uint64_t n) { if(n>SIZE_MAX||n>uint64_t(std::numeric_limits<std::streamsize>::max()))bad("chunk too large");Bytes b(static_cast<size_t>(n));in.clear();in.seekg(static_cast<std::streamoff>(off));if(!in||!in.read(reinterpret_cast<char*>(b.data()),static_cast<std::streamsize>(n)))bad("file read failed");return b; }
+// Preflight finite string budgets without constructing strings or expanding runs.
+// Charge every row, even when encoded predicates would avoid materialization.
+void check_string_budget(const Bytes& b,Type type,const ChunkMeta& m,uint64_t budget) {
+ if(type!=Type::String||budget==UINT64_MAX)return;
+ Cursor c{b};
+ auto length=[&]() { auto n=c.get(4);if(n>b.size()-c.p)bad("truncated string");c.p+=size_t(n);return n; };
+ auto charge=[&](uint64_t n,uint64_t count) {
+  if(n&&count>budget/n)bad("decoded string byte limit exceeded");
+  budget-=n*count;
+ };
+ if(m.encoding==Encoding::Dictionary){
+  auto count=c.get(4);
+  if(count>m.rows||count>(b.size()-c.p)/4)bad("invalid dictionary size");
+  std::vector<uint32_t> lengths;lengths.reserve(size_t(count));
+  for(uint64_t i=0;i<count;++i)lengths.push_back(uint32_t(length()));
+  if(b.size()-c.p!=uint64_t(m.rows)*4)bad("invalid dictionary codes size");
+  for(uint64_t i=0;i<m.rows;++i){auto id=c.get(4);if(id>=lengths.size())bad("invalid dictionary ID");charge(lengths[size_t(id)],1);}
+ }else if(m.encoding==Encoding::RLE){
+  uint64_t produced=0;
+  while(produced<m.rows){auto count=c.get(4);if(!count||count>m.rows-produced)bad("invalid run length");charge(length(),count);produced+=count;}
+ }else if(m.encoding==Encoding::Plain){
+  for(uint64_t i=0;i<m.rows;++i)charge(length(),1);
+ }else bad("invalid string encoding");
+ c.done();
+}
 void emit(std::ofstream& out,const Bytes& b) { out.write(reinterpret_cast<const char*>(b.data()),static_cast<std::streamsize>(b.size()));if(!out)bad("file write failed"); }
 unsigned width(uint64_t v) { unsigned n=0;while(v){++n;v>>=1;}return n; }
 void pack(Bytes& b,uint64_t v,unsigned w,uint64_t bit) { unsigned used=0;while(used<w){auto pos=bit+used;unsigned k=std::min<unsigned>(w-used,8-unsigned(pos%8));b[size_t(pos/8)]|=uint8_t((v>>used)&((1u<<k)-1))<<unsigned(pos%8);used+=k;} }
@@ -75,7 +100,7 @@ void write_file(const std::string& path,const std::vector<Field>& schema,const s
  for(size_t begin=0;begin<rows;){uint32_t n=uint32_t(std::min<size_t>(options.row_group_size,rows-begin));std::vector<ChunkMeta> group;for(size_t ci=0;ci<schema.size();++ci){ChunkMeta m;m.rows=n;m.offset=uint64_t(out.tellp());auto e=encode(columns[ci],begin,n,options.sample_size,m.min,m.max);m.encoding=e.encoding;m.bytes=e.bytes.size();emit(out,e.bytes);group.push_back(std::move(m));}groups.push_back(std::move(group));begin+=n;}
  Bytes footer;put(footer,rows,8);put(footer,schema.size(),4);put(footer,groups.size(),4);for(auto& f:schema){str(footer,f.name);put(footer,unsigned(f.type),1);}for(auto& g:groups)for(auto& m:g){put(footer,m.rows,4);put(footer,unsigned(m.encoding),1);put(footer,m.offset,8);put(footer,m.bytes,8);value(footer,m.min);value(footer,m.max);}emit(out,footer);Bytes tail;put(tail,footer.size(),8);const char* magic="MCOLEND1";tail.insert(tail.end(),magic,magic+8);emit(out,tail);out.flush();if(!out)bad("file flush failed");out.close();if(!out)bad("file close failed");
 }
-Reader::Reader(const std::string& path,ReadLimits limits):path_(path) {
+Reader::Reader(const std::string& path,ReadLimits limits):path_(path),max_decoded_string_bytes_(limits.max_decoded_string_bytes) {
  std::ifstream in(path,std::ios::binary|std::ios::ate);if(!in)bad("cannot open file");auto end=in.tellg();if(end<32)bad("file too short");uint64_t size=uint64_t(end);auto h=load(in,0,16);if(std::memcmp(h.data(),"MINICOL1",8))bad("invalid file magic");Cursor hc{h,8};if(hc.get(4)!=1)bad("unsupported format version");auto group_size=hc.get(4);if(!group_size)bad("invalid row group size");auto t=load(in,size-16,16);if(std::memcmp(t.data()+8,"MCOLEND1",8))bad("invalid trailer");Cursor tc{t};auto fl=tc.get(8);if(fl>size-32||fl<16)bad("invalid footer size");if(fl>limits.max_footer_bytes)bad("footer byte limit exceeded");auto b=load(in,size-16-fl,fl);Cursor c{b};rows_=c.get(8);auto nc=c.get(4),ng=c.get(4);if(!nc||nc>(b.size()-c.p)/5||ng!=(rows_/group_size+(rows_%group_size!=0)))bad("invalid schema/group count");if(std::min<uint64_t>(rows_,group_size)>limits.max_group_rows)bad("group row limit exceeded");for(uint64_t i=0;i<nc;++i){auto name=c.string();auto ty=c.get(1);if(ty>1)bad("invalid column type");schema_.push_back({name,Type(ty)});}if(ng&&(nc>(b.size()-c.p)/ng/29))bad("footer metadata truncated");
  uint64_t expected_offset=16,total_rows=0;
  for(uint64_t g=0;g<ng;++g){std::vector<ChunkMeta> group;uint32_t group_rows=uint32_t(std::min<uint64_t>(group_size,rows_-total_rows));for(uint64_t ci=0;ci<nc;++ci){ChunkMeta m;m.rows=uint32_t(c.get(4));auto enc=c.get(1);if(enc>3)bad("invalid encoding");m.encoding=Encoding(enc);m.offset=c.get(8);m.bytes=c.get(8);m.min=value(c,schema_[size_t(ci)].type);m.max=value(c,schema_[size_t(ci)].type);if(m.rows!=group_rows||!m.rows||less(m.max,m.min)||m.offset!=expected_offset||m.offset>size-16-fl||m.bytes>size-16-fl-m.offset)bad("invalid chunk metadata");if((m.encoding==Encoding::Dictionary&&schema_[size_t(ci)].type!=Type::String)||(m.encoding==Encoding::BitPacked&&schema_[size_t(ci)].type!=Type::Int64))bad("invalid encoding/type combination");if(m.bytes>limits.max_chunk_bytes)bad("chunk byte limit exceeded");expected_offset+=m.bytes;group.push_back(std::move(m));}total_rows+=group_rows;groups_.push_back(std::move(group));}
@@ -83,7 +108,7 @@ Reader::Reader(const std::string& path,ReadLimits limits):path_(path) {
 }
 Column Reader::read_column(size_t group,size_t column) const {
  if(group>=groups_.size()||column>=schema_.size())throw std::out_of_range("group/column");
- auto& m=groups_[group][column];std::ifstream in(path_,std::ios::binary);auto b=load(in,m.offset,m.bytes);Column result;if(schema_[column].type==Type::Int64)result=std::vector<int64_t>{};else result=std::vector<std::string>{};walk(b,schema_[column].type,m,[&](const Value& v){if(v.index()==0)std::get<0>(result).push_back(std::get<0>(v));else std::get<1>(result).push_back(std::get<1>(v));});return result;
+ auto& m=groups_[group][column];std::ifstream in(path_,std::ios::binary);auto b=load(in,m.offset,m.bytes);check_string_budget(b,schema_[column].type,m,max_decoded_string_bytes_);Column result;if(schema_[column].type==Type::Int64)result=std::vector<int64_t>{};else result=std::vector<std::string>{};walk(b,schema_[column].type,m,[&](const Value& v){if(v.index()==0)std::get<0>(result).push_back(std::get<0>(v));else std::get<1>(result).push_back(std::get<1>(v));});return result;
 }
 ScanResult Reader::scan(const Predicate& p,bool zones) const {
  return scan_all({p},zones);
@@ -128,6 +153,7 @@ SumResult Reader::scan_impl(const std::vector<Predicate>& predicates,bool zones,
   for(size_t ci=0;ci<columns.size();++ci){
    const auto column=columns[ci];const auto& m=group[column];
    auto b=load(in,m.offset,m.bytes);result.bytes_read+=m.bytes;
+   check_string_budget(b,schema_[column].type,m,max_decoded_string_bytes_);
    uint64_t matched=0;uint32_t row=0;
    // Single-column counts keep the encoded count fast path and need no selection.
    if(columns.size()==1&&!projection){

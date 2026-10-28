@@ -141,7 +141,8 @@ chunk in addition to the currently loaded predicate chunk.
 
 ## Resource limits and fuzzing
 
-`Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows})`
+`Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
+max_decoded_string_bytes})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -150,17 +151,42 @@ header's target size; an empty table satisfies a zero row/chunk limit. A zero
 footer limit rejects every file. Limit violations throw `std::runtime_error`.
 Limits do not alter persisted bytes or require a format-v1 version bump.
 
-Defaults are `UINT64_MAX`, `UINT64_MAX`, and `UINT32_MAX`: existing callers retain
-all format-v1 dimensions, subject to file-bound checks, address space, stream
+`max_decoded_string_bytes` is the inclusive sum of string byte lengths over all
+rows of each loaded string chunk. NUL bytes count; length prefixes and string
+object/allocation overhead do not. Dictionary entries count once per referencing
+row, and RLE values count once per row in the run. Empty strings consume zero
+bytes. The budget resets for each chunk and operation; it is not cumulative over
+a column, Reader, or query. Existing three-field limit initializers keep an
+unlimited decoded-string budget.
+
+For a finite cap, a preflight parses string lengths, run lengths, and dictionary
+IDs after loading encoded bytes but before constructing dictionary strings,
+decoder batches, or materialized row strings. It checks repeated lengths against
+the remaining budget without overflowing. Exceeding the cap throws
+`std::runtime_error("decoded string byte limit exceeded")`. Construction still
+validates metadata only; a string cap can therefore reject a later operation.
+`read_column`, count/AND scans, and sum predicate scans apply the same cap to all
+rows of a loaded chunk, even if few rows match or the codec avoids expansion.
+Zone-pruned chunks, columns avoided by empty selections, and metadata-only scans
+are not checked. Integer chunks are unaffected. Finite caps add a parsing pass;
+dictionary preflight uses one uint32 length per dictionary entry. Defaults skip
+this pass. This bounds logical string content, not process memory: encoded
+buffers, metadata strings, unused dictionary entries, vector capacity, temporary
+copies, and object overhead still need separate accounting. Total query work and
+memory retained by callers across reads remain unbounded.
+
+Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, and `UINT64_MAX`:
+existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit
-limits; for example `{1048576, 16777216, 65536}` caps the footer at 1 MiB, each
-encoded chunk at 16 MiB, and each actual group at 65,536 rows. These are input
+limits; for example `{1048576, 16777216, 65536, 16777216}` caps the footer at
+1 MiB, each encoded chunk at 16 MiB, each actual group at 65,536 rows, and
+decoded string content per loaded chunk at 16 MiB. These are input
 dimension caps, not an exact allocation or runtime budget. Metadata allocations
 include all schema/group objects and copied strings in addition to the footer
-buffer. Dictionary and RLE strings can expand on materialization; decoded string
-storage can scale with group rows times encoded chunk bytes. Count/sum scans can
-visit all groups, and there is no total-row, total-file, or elapsed-time cap.
+buffer. Without a decoded-string cap, dictionary and RLE strings can expand on
+materialization; decoded string storage can scale with group rows times encoded
+chunk bytes. Count/sum scans can visit all groups, and there is no total-row, total-file, or elapsed-time cap.
 The reader still validates payloads only when loaded and assumes immutable files.
 
 `make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the
@@ -176,8 +202,9 @@ For a longer run after building:
 ./build/fuzz_reader build/fuzz-corpus -seed=42 -runs=100000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts/
 ```
 
-The harness caps input at 65,536 bytes, footer/chunk bytes at 4,096 each, and
-actual group rows at 64. After metadata validation it exercises payloads only
+The harness caps input at 65,536 bytes, footer/chunk bytes at 4,096 each,
+actual group rows at 64, and decoded string bytes per chunk at 8,192. After
+metadata validation it exercises payloads only
 for tables with at most 256 total rows and four columns. Expected parse/decode
 errors are rejected inputs; allocation failures and sanitizer errors remain
 failures. Accepted payloads are materialized and checked against independent

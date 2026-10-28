@@ -69,7 +69,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::vector<Column> columns;
     bool trustworthy_zones = true;
     try {
-        Reader reader(path, {4096, 4096, 64});
+        Reader reader(path, {4096, 4096, 64, 8192});
         if (reader.rows() > 256 || reader.schema().size() > 4) return 0;
         for (size_t c = 0; c < reader.schema().size(); ++c) {
             Column all = reader.schema()[c].type == Type::Int64
@@ -92,7 +92,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     // Outside the rejection handler: successfully decoded chunks must scan and
     // aggregate consistently with this independent, materialized scalar oracle.
-    Reader reader(path, {4096, 4096, 64});
+    Reader reader(path, {4096, 4096, 64, 8192});
     std::vector<Predicate> predicates;
     require(reader.scan_all({}).matched == reader.rows());
     if (reader.rows()) {
