@@ -78,12 +78,38 @@ uint64_t conjunction_oracle(const std::vector<Column>& columns,
     }
     return matched;
 }
+uint64_t sum_oracle(const std::vector<Column>& columns, size_t projection,
+                    const std::vector<Predicate>& predicates) {
+    uint64_t sum = 0;
+    const auto& values = std::get<std::vector<int64_t>>(columns.at(projection));
+    for (size_t row = 0; row < values.size(); ++row) {
+        bool hit = true;
+        for (const auto& p : predicates) {
+            const auto v = std::visit([&](const auto& column) -> Value { return column[row]; },
+                                      columns.at(p.column));
+            if (!satisfies(v, p)) hit = false;
+        }
+        if (hit) sum += static_cast<uint64_t>(values[row]);
+    }
+    return sum;
+}
 void conjunctions(const Reader& reader, const std::vector<Column>& columns,
                   const std::vector<Predicate>& predicates) {
     const auto expected = conjunction_oracle(columns, predicates);
     for (bool zones : {false, true}) {
         const auto result = reader.scan_all(predicates, zones);
         check(result.matched == expected, "AND scan differs from scalar row oracle");
+        for (size_t c = 0; c < columns.size(); ++c) {
+            if (columns[c].index() != 0) continue;
+            const auto aggregate = reader.sum_int64(c, predicates, zones);
+            check(aggregate.scan.matched == expected, "sum count differs from scalar row oracle");
+            check(uint64_t(aggregate.sum) == sum_oracle(columns, c, predicates),
+                  "projected sum differs from scalar row oracle");
+            auto reverse = predicates;
+            std::reverse(reverse.begin(), reverse.end());
+            check(reader.sum_int64(c, reverse, zones).sum == aggregate.sum,
+                  "sum independent of predicate order");
+        }
         if (predicates.empty()) {
             check(result.bytes_read == reader.metadata_bytes() && result.groups_read == 0 &&
                   result.groups_skipped == 0 && result.batches == 0, "empty AND reads metadata only");
@@ -314,6 +340,18 @@ void payload_corruption_tests(const Scratch& scratch) {
         throws([&] { broken.scan_all({{1, Op::Equal, int64_t(0), int64_t(0)},
                                      {0, Op::Equal, low, low}}, false); },
                "malformed codec rejected in AND selection path");
+        const Predicate guard{1, Op::Equal, int64_t(0), int64_t(0)};
+        if (type == Type::Int64)
+            throws([&] { broken.sum_int64(0, {guard}, false); },
+                   "malformed projected integer payload rejected");
+        throws([&] { broken.sum_int64(1, {{0, Op::Equal, low, low}}, false); },
+               "malformed aggregate predicate payload rejected");
+        const Predicate absent{1, Op::Equal, int64_t(1), int64_t(1)};
+        for (bool zones : {false, true}) {
+            const auto empty = broken.sum_int64(type == Type::Int64 ? 0 : 1, {absent}, zones);
+            check(empty.sum == 0 && empty.scan.matched == 0,
+                  "empty aggregate avoids malformed unused payload");
+        }
     };
     std::vector<int64_t> long_runs(4096, 0);
     std::fill(long_runs.begin() + 2048, long_runs.end(), 1);
@@ -331,6 +369,60 @@ void payload_corruption_tests(const Scratch& scratch) {
     for (size_t i = 0; i < 50; ++i) unique.push_back(std::to_string(i));
     corrupt_payload("bad-string.mc", unique, Type::String, Encoding::Plain,
                     [](auto& b, const auto& m) { for (size_t i = 0; i < 4; ++i) b[m.offset + i] = char(255); });
+}
+void aggregate_tests(const Scratch& scratch) {
+    const auto lo = std::numeric_limits<int64_t>::min();
+    const auto hi = std::numeric_limits<int64_t>::max();
+    const auto path = scratch.file("aggregate.mc");
+    const std::vector<Column> columns{std::vector<int64_t>{hi, 1, lo, -1, 4},
+                                      std::vector<int64_t>{0, 0, 1, 1, 2},
+                                      std::vector<std::string>{"a", "a", "b", "b", "c"}};
+    write_file(path, {{"value", Type::Int64}, {"guard", Type::Int64}, {"text", Type::String}},
+               columns, {2, 2});
+    Reader r(path);
+    const Predicate positive{1, Op::Equal, int64_t(0), int64_t(0)};
+    const Predicate negative{1, Op::Equal, int64_t(1), int64_t(0)};
+    check(r.sum_int64(0, {positive}).sum == lo, "positive sum overflow wraps to INT64_MIN");
+    check(r.sum_int64(0, {negative}).sum == hi, "negative sum overflow wraps to INT64_MAX");
+    check(r.sum_int64(0).sum == 3, "sum wraps across row groups");
+    conjunctions(r, columns, {});
+    conjunctions(r, columns, {positive});
+    const auto all = r.sum_int64(0);
+    uint64_t projected_bytes = r.metadata_bytes(), two_bytes = r.metadata_bytes();
+    uint64_t guard_bytes = r.metadata_bytes();
+    for (const auto& g : r.groups()) {
+        projected_bytes += g[0].bytes;
+        guard_bytes += g[1].bytes;
+        two_bytes += g[0].bytes + g[1].bytes;
+    }
+    check(all.scan.bytes_read == projected_bytes && all.scan.groups_read == 3 &&
+          all.scan.groups_skipped == 0 && all.scan.batches == 3,
+          "unfiltered sum reads only projection with group and batch accounting");
+    const Predicate shared{0, Op::Between, lo, hi};
+    check(r.sum_int64(0, {shared, shared}, false).scan.bytes_read == projected_bytes,
+          "projection shared with repeated predicates read once");
+    const Predicate every{1, Op::Between, int64_t(0), int64_t(2)};
+    check(r.sum_int64(0, {every}, false).scan.bytes_read == two_bytes,
+          "sum reads exactly predicate and projection columns");
+    const Predicate missing{1, Op::Equal, int64_t(9), int64_t(0)};
+    const auto pruned = r.sum_int64(0, {missing});
+    check(pruned.sum == 0 && pruned.scan.matched == 0 && pruned.scan.groups_read == 0 &&
+          pruned.scan.groups_skipped == 3 && pruned.scan.bytes_read == r.metadata_bytes() &&
+          pruned.scan.batches == 0, "all-pruned sum reads metadata only");
+    check(r.sum_int64(0, {missing}, false).scan.bytes_read == guard_bytes,
+          "empty selection skips projected chunk without zones");
+    const auto partial = r.sum_int64(0, {positive});
+    check(partial.scan.groups_read == 1 && partial.scan.groups_skipped == 2 &&
+          partial.scan.batches == 1 && partial.scan.bytes_read == r.metadata_bytes() +
+          r.groups()[0][0].bytes + r.groups()[0][1].bytes, "pruned aggregate exact counters");
+    throws([&] { r.sum_int64(99, {missing}); }, "validate projection column before pruning");
+    throws([&] { r.sum_int64(2, {missing}); }, "reject string sum before pruning");
+    throws([&] { r.sum_int64(0, {missing, {99, Op::Equal, int64_t(0), int64_t(0)}}); },
+           "validate aggregate predicate column before pruning");
+    throws([&] { r.sum_int64(0, {missing, {0, Op::Between, int64_t(0), std::string()}}); },
+           "validate aggregate predicate types before pruning");
+    throws([&] { r.sum_int64(0, {missing, {0, static_cast<Op>(99), int64_t(0), int64_t(0)}}); },
+           "validate aggregate predicate operation before pruning");
 }
 void invalid_tests(const Scratch& scratch) {
     const auto path = scratch.file("invalid.mc");
@@ -369,6 +461,7 @@ int main() {
         edge_tests(scratch);
         pruning_tests(scratch);
         conjunction_tests(scratch);
+        aggregate_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);
         std::cout << "PASS: " << checks << " checks (encodings, scalar oracle, edge cases, pruning, malformed files)\n";

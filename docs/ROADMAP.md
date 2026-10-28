@@ -10,12 +10,11 @@
 
 ## Next useful improvements, in order
 
-1. Add projected aggregate scans using the internal AND selection vectors; verify against a scalar oracle and define integer overflow semantics.
-2. Strengthen bounded malformed-input tests and add a fuzz target; document exact resource limits.
-3. Add streaming row-group writes and bounded-memory readers for large inputs.
-4. Add file/chunk checksums with a format version bump and compatibility tests.
-5. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
-6. Improve bit unpacking hot loops only after profiling; report before/after measurements with compiler and machine details.
+1. Strengthen bounded malformed-input tests and add a fuzz target; document exact resource limits.
+2. Add streaming row-group writes and bounded-memory readers for large inputs.
+3. Add file/chunk checksums with a format version bump and compatibility tests.
+4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
+5. Improve bit unpacking hot loops only after profiling; report before/after measurements with compiler and machine details.
 
 Every scheduled run should choose one bounded improvement, validate it, update this log, and commit/push useful changes. Do not manufacture commit activity or benchmark claims. Resume handoff numbers describe the checked-in initial raw results; refresh claims explicitly when rerunning.
 
@@ -59,3 +58,39 @@ Prepared hourly generation → isolated validation → publication workflow, pin
 ## Cloud handoff verified — 2026-10-27
 
 First cloud run 40596007041 passed all three jobs and published af440d8 with bhinu author attribution. API credential and hourly enable switch are configured. Local hourly automation paused after verification. Generation, validation, and publication now run on GitHub-hosted runners independently of the Mac. See docs/CLOUD_RUNNER.md for controls and run evidence.
+
+## Projected int64 sums — 2026-10-28
+
+- Added `Reader::sum_int64(column, predicates, zone_maps)` over internal AND
+  selections, returning the sum and existing scan counters. Empty predicates sum
+  the whole projected column; empty selections return zero. Addition wraps modulo
+  2^64 and interprets the result as signed two's complement, including across
+  row groups. No dependencies or format v1 changes.
+- Reused predicate validation, encoded predicate evaluation, zone pruning, and
+  early termination. Projection chunks are loaded only for surviving selections;
+  shared predicate/projection chunks are retained and read from the file once.
+  Documented semantics, logical byte accounting, validation boundaries, memory
+  use, and current full-chunk decoding in FORMAT.md; added a README example.
+- Release suite passes 5,637 checks. Independent row-wise scalar sum oracles cover
+  all existing predicate codecs and plain/RLE/packed integer projections, random
+  data (existing seeds 7331, 91527, 87291), predicate reversal, repeated columns,
+  contradictions, reversed ranges, integer extremes, empty tables/selections,
+  batch/group tails, and overflow. Added exact projection byte/group/batch checks,
+  invalid projection/predicate checks, and malformed aggregate payload tests.
+- Checks: `make test` passed. `make sanitize` reached the container's existing
+  LeakSanitizer fatal error because leak detection cannot run under ptrace;
+  `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed with ASan/UBSan active.
+  Leak detection remains unverified in this environment.
+- Benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-2026-10-28`. All five existing count
+  workloads and three methods agreed with the row-store baseline. Retained all
+  15 trials in [raw CSV](benchmark-smoke-2026-10-28.csv), with machine/compiler,
+  flags, seed, cache assumptions, byte accounting, and limitations in the
+  [environment record](benchmark-smoke-2026-10-28-environment.txt). This smoke
+  makes no aggregate performance claim; earlier benchmark evidence is preserved.
+- Remaining: bounded malformed-input tests/fuzzing and exact resource limits are
+  the next independent increment. Other aggregate operations, checked-overflow
+  alternatives, aggregate/AND benchmark workloads, and streaming readers/writers
+  remain future work. Summation currently decodes the full projected chunk and
+  redecodes it when shared with predicates; RLE sums expand values in the scalar
+  consumer. Optimizing those paths requires profiling and retained measurements.

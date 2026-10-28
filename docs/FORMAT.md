@@ -104,3 +104,37 @@ counter includes those bytes even when a benchmark reuses a Reader. Payloads
 are loaded from the file anew for each scan. `read_column` reconstructs a full
 column chunk and is intended for round-trip checks and consumers requiring
 materialized data.
+
+## Projected integer sum
+
+`sum_int64(column, predicates, zone_maps)` returns `SumResult`, containing
+`int64_t sum` and `ScanResult scan`. It sums the projected int64 column over
+the rows satisfying the same AND predicates as `scan_all`; `scan.matched` is
+the number of selected rows. An empty predicate list sums every row. An empty
+table or selection returns zero. String projections and out-of-range columns
+are rejected, and all predicates are validated before pruning.
+
+Addition is defined modulo 2^64, with the resulting bits interpreted as a signed
+two's-complement int64. For example, `INT64_MAX + 1` yields `INT64_MIN`, and
+`INT64_MIN - 1` yields `INT64_MAX`. Intermediate overflow does not throw or
+saturate; the implementation accumulates unsigned values without signed overflow.
+This contract applies across row-group boundaries and is independent of
+predicate order. The on-disk format remains v1.
+
+The sum uses group-local AND selections. Predicate chunks are read in the same
+order as count scans, and the projected chunk is read only if rows survive
+(or if there are no predicates). When projection is also a predicate column,
+its encoded bytes are retained and decoded again for summation, without another
+file read. Every loaded chunk is structurally validated, including unselected
+values within a loaded projection. Skipped chunks are not payload-validated.
+Summation currently decodes the entire projected chunk, including RLE expansion
+through the scalar consumer; this is not a performance claim or a streaming
+aggregate implementation.
+
+`scan.bytes_read` includes metadata once and each loaded predicate/projected
+chunk once. It measures logical requested bytes, not physical reads. Group and
+logical batch counters follow count-scan semantics, counting each visited group
+once even when its selection is empty. An unfiltered sum visits every group and
+reads only the projected column; an empty table visits no groups. Memory includes
+row-group selections, decoder allocations, and one retained encoded projected
+chunk in addition to the currently loaded predicate chunk.

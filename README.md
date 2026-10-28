@@ -19,6 +19,7 @@ python3 bench/summarize.py docs/benchmark-raw.csv
 - Versioned little-endian binary format: fixed-size row groups (65,536 rows by default, final group may be shorter), contiguous column chunks, footer with schema, offsets, encodings, counts, and per-chunk min/max.
 - Plain fallback plus dictionary strings, integer/string RLE, and signed integer frame-of-reference bit packing. Sampling gates dictionary/RLE candidates; actual encoded sizes prevent expansion. Integer min/max determines packed width. Decisions are independent per column per row group.
 - Zone maps skip groups whose ranges cannot satisfy equality or inclusive range predicates. AND scans intersect row selections across predicate columns and stop reading a group when no rows remain.
+- Projected int64 sums over AND selections, with defined two's-complement wraparound and per-scan byte/group counters.
 - Batches of up to 1,024 values, dictionary predicates evaluated through integer IDs, and RLE predicates evaluated once per run. Scalar C++ batch execution; no explicit SIMD intrinsics.
 - Reader validation, full-column roundtrip decoding, scan counters, independent scalar-oracle correctness tests, ASan/UBSan, and a Linux/macOS CI workflow template.
 - Deterministic benchmark against a fixed-width binary row store with identical rows and query results.
@@ -37,6 +38,10 @@ auto both = reader.scan_all({
     {0, Op::Between, int64_t(2), int64_t(4)},
     {0, Op::Equal, int64_t(3), int64_t(0)}});
 // both.matched == 1; predicates may also reference different columns
+auto total = reader.sum_int64(0, {
+    {0, Op::Between, int64_t(2), int64_t(4)}});
+// total.sum == 9; total.scan.matched == 3
+// An empty predicate list sums the entire projected column.
 ```
 
 Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
@@ -47,4 +52,4 @@ An hourly GitHub-hosted development worker is active and its first generation, v
 
 See [measured benchmarks](docs/BENCHMARKS.md), [raw trials](docs/benchmark-raw.csv), [format](docs/FORMAT.md), [Claude resume handoff](docs/CLAUDE_HANDOFF.md), and [roadmap](docs/ROADMAP.md).
 
-This is an educational prototype. Supports non-null int64/string columns, single-column count predicates, and AND count scans. No SQL parser, joins, transactional updates, concurrent writers, checksums, or production durability guarantees. Writer accepts the full table in memory. Batch processing is not a claim of SIMD. Adaptive encoding is the implemented automatic physical optimization; there is no workload-driven reclustering. Benchmark bytes are logical file bytes requested, not physical disk I/O. Timings depend on this machine and synthetic workloads.
+This is an educational prototype. Supports non-null int64/string columns, single-column count predicates, AND count scans, and projected int64 sums. No SQL parser, joins, transactional updates, concurrent writers, checksums, or production durability guarantees. Writer accepts the full table in memory. Batch processing is not a claim of SIMD. Adaptive encoding is the implemented automatic physical optimization; there is no workload-driven reclustering. Benchmark bytes are logical file bytes requested, not physical disk I/O. Timings depend on this machine and synthetic workloads.

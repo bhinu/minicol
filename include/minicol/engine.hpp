@@ -13,6 +13,7 @@ struct Field { std::string name; Type type; };
 struct Predicate { size_t column; Op op; Value low; Value high; };
 struct ChunkMeta { uint64_t offset=0, bytes=0; uint32_t rows=0; Encoding encoding=Encoding::Plain; Value min=int64_t(0), max=int64_t(0); };
 struct ScanResult { uint64_t matched=0, bytes_read=0, groups_read=0, groups_skipped=0, batches=0; };
+struct SumResult { ScanResult scan; int64_t sum=0; };
 struct WriteOptions { uint32_t row_group_size=65536; uint32_t sample_size=2048; };
 void write_file(const std::string& path, const std::vector<Field>& schema, const std::vector<Column>& columns, WriteOptions options={});
 class Reader {
@@ -25,7 +26,10 @@ public:
  Column read_column(size_t group, size_t column) const;
  ScanResult scan(const Predicate& predicate, bool zone_maps=true) const;
  ScanResult scan_all(const std::vector<Predicate>& predicates, bool zone_maps=true) const;
+ // Sum selected int64 values modulo 2^64, interpreted as signed two's complement.
+ SumResult sum_int64(size_t column, const std::vector<Predicate>& predicates={}, bool zone_maps=true) const;
 private:
+ SumResult scan_impl(const std::vector<Predicate>& predicates, bool zone_maps, const size_t* projection) const;
  std::string path_;
  std::vector<Field> schema_;
  std::vector<std::vector<ChunkMeta>> groups_;

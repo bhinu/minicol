@@ -89,6 +89,14 @@ ScanResult Reader::scan(const Predicate& p,bool zones) const {
  return scan_all({p},zones);
 }
 ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones) const {
+ return scan_impl(predicates,zones,nullptr).scan;
+}
+SumResult Reader::sum_int64(size_t column,const std::vector<Predicate>& predicates,bool zones) const {
+ if(column>=schema_.size())throw std::out_of_range("projection column");
+ if(schema_[column].type!=Type::Int64)bad("sum requires integer column");
+ return scan_impl(predicates,zones,&column);
+}
+SumResult Reader::scan_impl(const std::vector<Predicate>& predicates,bool zones,const size_t* projection) const {
  // Validate every predicate before pruning or short-circuiting any payload reads.
  std::vector<size_t> columns;
  std::vector<std::vector<const Predicate*>> by_column;
@@ -101,8 +109,9 @@ ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones)
   if(it==columns.end()){columns.push_back(p.column);by_column.push_back({&p});}
   else by_column[size_t(it-columns.begin())].push_back(&p);
  }
- ScanResult result;result.bytes_read=metadata_bytes_;
- if(predicates.empty()){result.matched=rows_;return result;}
+ SumResult aggregate;auto& result=aggregate.scan;result.bytes_read=metadata_bytes_;
+ uint64_t sum=0;
+ if(predicates.empty()&&!projection){result.matched=rows_;return aggregate;}
  std::ifstream in(path_,std::ios::binary);
  for(const auto& group:groups_){
   bool skip=false;
@@ -115,12 +124,13 @@ ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones)
   if(skip){++result.groups_skipped;continue;}
   ++result.groups_read;result.batches+=(uint64_t(group.front().rows)+1023)/1024;
   std::vector<uint32_t> selection;
+  Bytes projected;bool projection_loaded=false;
   for(size_t ci=0;ci<columns.size();++ci){
    const auto column=columns[ci];const auto& m=group[column];
    auto b=load(in,m.offset,m.bytes);result.bytes_read+=m.bytes;
    uint64_t matched=0;uint32_t row=0;
    // Single-column counts keep the encoded count fast path and need no selection.
-   if(columns.size()==1){
+   if(columns.size()==1&&!projection){
     walk(b,schema_[column].type,m,[&](const Value& v){matched+=matches_all(v,by_column[ci]);},&by_column[ci],&matched);
     result.matched+=matched;break;
    }
@@ -129,6 +139,7 @@ ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones)
     if(matches_all(v,by_column[ci]))hits.push_back(row);
     ++row;
    },&by_column[ci],&matched,&hits);
+   if(projection&&column==*projection){projected=std::move(b);projection_loaded=true;}
    if(ci==0)selection=std::move(hits);
    else {
     // Both vectors are sorted group-local row offsets. Compact in place.
@@ -141,8 +152,21 @@ ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones)
    }
    if(selection.empty())break;
   }
-  if(columns.size()>1)result.matched+=selection.size();
+  if(projection){
+   if(!predicates.empty()&&selection.empty())continue;
+   const auto& m=group[*projection];
+   if(!projection_loaded){projected=load(in,m.offset,m.bytes);result.bytes_read+=m.bytes;}
+   uint32_t row=0;size_t selected=0;
+   walk(projected,Type::Int64,m,[&](const Value& v){
+    if(predicates.empty()||(selected<selection.size()&&selection[selected]==row)){
+     sum+=uint64_t(std::get<int64_t>(v));++selected;
+    }
+    ++row;
+   });
+   result.matched+=predicates.empty()?m.rows:selection.size();
+  }else if(columns.size()>1)result.matched+=selection.size();
  }
- return result;
+ aggregate.sum=signed_bits(sum);
+ return aggregate;
 }
 } // namespace minicol
