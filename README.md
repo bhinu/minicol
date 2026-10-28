@@ -51,8 +51,11 @@ Compile with `c++ -std=c++17 -Iinclude src/engine.cpp your_program.cpp -o demo`.
 For untrusted files, opt into input limits, for example
 `Reader reader("example.mcol", ReadLimits{1048576, 16777216, 65536, 16777216});`.
 These cap footer bytes, encoded bytes per chunk, actual rows per group, and
-decoded string bytes per loaded chunk, respectively. Defaults retain all format-v1
-dimensions. See
+decoded string bytes per loaded chunk, respectively. An optional fifth field,
+`max_payload_bytes_per_operation`, caps cumulative encoded chunk bytes loaded by
+each read, count/AND scan, or sum call (excluding metadata). For example,
+`ReadLimits{1048576, 16777216, 65536, 16777216, 33554432}` adds a 32 MiB
+per-operation payload budget. Defaults retain all format-v1 dimensions. See
 [resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
 validation boundaries and memory limitations.
 

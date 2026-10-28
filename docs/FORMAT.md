@@ -142,7 +142,7 @@ chunk in addition to the currently loaded predicate chunk.
 ## Resource limits and fuzzing
 
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
-max_decoded_string_bytes})`
+max_decoded_string_bytes, max_payload_bytes_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -175,7 +175,35 @@ buffers, metadata strings, unused dictionary entries, vector capacity, temporary
 copies, and object overhead still need separate accounting. Total query work and
 memory retained by callers across reads remain unbounded.
 
-Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, and `UINT64_MAX`:
+`max_payload_bytes_per_operation` is an inclusive cumulative budget for encoded
+chunk bytes loaded during one `read_column`, `scan`, `scan_all`, or `sum_int64`
+call. The budget resets on every call, including after a failure. Each chunk is
+charged immediately before allocating/loading its payload, using subtraction
+from the remaining budget to avoid overflow. Exceeding the budget throws
+`std::runtime_error("operation payload byte limit exceeded")`; no partial result
+is returned. Earlier chunks may already have been read and decoded. Reader
+construction still checks metadata only and does not reject a table whose total
+payload exceeds this operation budget.
+
+Metadata bytes are excluded, although `ScanResult::bytes_read` still includes
+metadata once. Pruned chunks and chunks avoided by an empty selection consume
+no budget. Repeated predicates and a shared predicate/projection chunk consume
+encoded bytes once per group, including when retained bytes are decoded again
+for summation. An empty conjunction count consumes zero; an unfiltered sum
+charges its projected chunks. `read_column` charges its single chunk. A zero
+budget therefore permits metadata-only operations and fully pruned scans.
+Predicate and projection validation still precedes payload loading. Predicate
+order may determine whether a call fits the budget through early termination.
+
+This cap bounds logical encoded payload bytes requested per operation, not
+physical disk reads, decoded row visits, elapsed time, or process memory. Tiny
+RLE/packed payloads can represent many rows; combine this budget with group-row
+and decoded-string limits for untrusted files. Footer parsing, predicate-list
+processing, repeated decoding, metadata traversal, allocation overhead, and
+caller-retained results need separate budgets. Existing four-field limit
+initializers retain an unlimited per-operation payload budget.
+
+Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit
@@ -186,7 +214,7 @@ dimension caps, not an exact allocation or runtime budget. Metadata allocations
 include all schema/group objects and copied strings in addition to the footer
 buffer. Without a decoded-string cap, dictionary and RLE strings can expand on
 materialization; decoded string storage can scale with group rows times encoded
-chunk bytes. Count/sum scans can visit all groups, and there is no total-row, total-file, or elapsed-time cap.
+chunk bytes. Count/sum scans can visit all groups, and there is no total-row, total-file, decoded-row-work, or elapsed-time cap.
 The reader still validates payloads only when loaded and assumes immutable files.
 
 `make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the

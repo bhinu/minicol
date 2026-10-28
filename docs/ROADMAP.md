@@ -186,3 +186,46 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   columns), longer fuzz campaigns and regression cases for findings. Streaming
   writes and bounded-memory readers remain the next larger feature; checksums,
   expanded benchmarks, and profiling remain later roadmap items.
+
+## Per-operation payload-byte budgets — 2026-10-28
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_payload_bytes_per_operation`: an inclusive cumulative cap on
+  encoded chunk bytes loaded by each materialization, count/AND scan, or sum
+  call. Charge before allocating/reading each payload, using subtraction to
+  avoid overflow; return an exception rather than a partial result if exceeded.
+  Defaults and existing aggregate initializers retain unlimited budgets. Format
+  v1, dependencies, and persisted bytes are unchanged.
+- Budgets reset per operation, including after failures, and exclude metadata.
+  Pruning and empty selections avoid charges; repeated predicates and retained
+  predicate/projection chunks charge bytes once per group. Documented exact
+  semantics, error, predicate-order effects, and limitations in FORMAT.md and
+  added a README example. This bounds logical payload bytes requested, not
+  physical I/O, decoded row visits, elapsed time, or process memory.
+- Release and ASan/UBSan suites pass 6,279 checks. Added scalar-oracle count,
+  AND, and wrapping-sum comparisons across every existing codec/type, multiple
+  groups and a short tail, exact and one-below budgets, repeated calls, separate
+  and shared projections, partial/full pruning, early termination, zero-budget
+  empty tables/metadata scans, and malformed-payload error precedence. Existing
+  source-checked chunk roundtrips and metadata byte accounting remain covered.
+- Checks: `make test` passed with `-O3 -DNDEBUG`.
+  The initial `make sanitize` exposed a test-fixture mistake (an absent value
+  inside a broad zone range still requires a payload read), which was fixed,
+  and reached the known LeakSanitizer fatal error under ptrace.
+  `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed the final 6,279 checks with
+  address and undefined-behavior sanitizers enabled. Leak detection remains
+  unverified in this environment. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-operation-budget-2026-10-28`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  Retained all 15 trials in the [raw CSV](benchmark-smoke-operation-budget-2026-10-28.csv),
+  with command, seed, row/trial counts, machine/compiler, flags, cache assumptions,
+  logical byte accounting, and limitations in the
+  [environment record](benchmark-smoke-operation-budget-2026-10-28-environment.txt).
+  The benchmark uses unlimited defaults; no performance claim is made and
+  earlier benchmark evidence is preserved.
+- Remaining: decoded-row/CPU work and metadata-traversal budgets, full allocation
+  accounting (including caller-retained results), longer fuzz campaigns and
+  regression cases for findings. Streaming writes and bounded-memory reads
+  remain the next larger feature; checksums, expanded benchmarks, and profiling
+  remain later roadmap items.

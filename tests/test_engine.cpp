@@ -498,6 +498,104 @@ void bounded_input_tests(const Scratch& scratch) {
     scans(bounded, columns, filters);
     conjunctions(bounded, columns, filters);
     conjunctions(bounded, columns, {});
+    // Operation budgets accumulate across columns/groups, independently of per-chunk caps.
+    auto with_budget = [&](uint64_t bytes) {
+        return Reader(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, UINT64_MAX, bytes});
+    };
+    auto budget_rejects = [&](const std::function<void()>& operation) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) {
+            rejected = std::string(e.what()) == "operation payload byte limit exceeded";
+        }
+        check(rejected, "operation rejects with payload budget error");
+    };
+    auto boundary = [&](uint64_t bytes, const std::function<void(const Reader&)>& operation) {
+        check(bytes > 0, "nonempty operation budget fixture");
+        const auto exact = with_budget(bytes);
+        operation(exact);
+        operation(exact); // Each call gets a fresh budget.
+        const auto below = with_budget(bytes - 1);
+        budget_rejects([&] { operation(below); });
+        check(below.scan_all({}).matched == plain.size(), "failed call leaves reader usable");
+    };
+    for (size_t c = 0; c < columns.size(); ++c) {
+        uint64_t bytes = 0;
+        for (size_t g = 0; g < bounded.groups().size(); ++g) {
+            const auto& m = bounded.groups()[g][c];
+            bytes += m.bytes;
+            const auto wanted = bounded.read_column(g, c);
+            boundary(m.bytes, [&](const Reader& r) {
+                check(r.read_column(g, c) == wanted, "payload budget roundtrip matches source-checked chunk");
+            });
+        }
+        const Value low = c < 3 ? Value(lo) : Value(std::string());
+        const Value high = c < 3 ? Value(hi) : Value(std::string(1, char(127)));
+        const Predicate all{c, Op::Between, low, high};
+        boundary(bytes, [&](const Reader& r) {
+            for (bool zones : {false, true}) {
+                const auto result = r.scan(all, zones);
+                check(result.matched == oracle(columns[c], all), "budgeted count matches scalar oracle");
+                check(result.bytes_read == r.metadata_bytes() + bytes, "budget excludes metadata");
+                check(r.scan_all({all, all}, zones).matched == oracle(columns[c], all),
+                      "repeated predicates charge a chunk once");
+            }
+        });
+        if (c < 3) boundary(bytes, [&](const Reader& r) {
+            for (const auto& predicates : std::vector<std::vector<Predicate>>{{}, {all, all}}) {
+                const auto result = r.sum_int64(c, predicates, false);
+                check(uint64_t(result.sum) == sum_oracle(columns, c, predicates),
+                      "budgeted shared/unfiltered projection matches scalar oracle");
+                check(result.scan.bytes_read == r.metadata_bytes() + bytes,
+                      "shared projection charges encoded bytes once");
+            }
+        });
+    }
+    const std::vector<Predicate> budget_filters{
+        {0, Op::Between, lo, hi},
+        {4, Op::Between, std::string(), std::string(1, char(127))}};
+    uint64_t two_columns = 0, three_columns = 0;
+    for (const auto& g : bounded.groups()) {
+        two_columns += g[0].bytes + g[4].bytes;
+        three_columns += g[0].bytes + g[4].bytes + g[1].bytes;
+    }
+    boundary(two_columns, [&](const Reader& r) {
+        check(r.scan_all(budget_filters, false).matched == conjunction_oracle(columns, budget_filters),
+              "multi-column budgeted AND matches scalar oracle");
+        check(uint64_t(r.sum_int64(0, budget_filters, false).sum) == sum_oracle(columns, 0, budget_filters),
+              "AND with shared projection matches scalar oracle");
+    });
+    boundary(three_columns, [&](const Reader& r) {
+        check(uint64_t(r.sum_int64(1, budget_filters, false).sum) == sum_oracle(columns, 1, budget_filters),
+              "separate projection charged after predicates");
+    });
+    const Predicate tail_pruned{1, Op::Equal, int64_t(30), int64_t(0)};
+    uint64_t pruned_bytes = bounded.groups()[0][1].bytes + bounded.groups()[1][1].bytes;
+    boundary(pruned_bytes, [&](const Reader& r) {
+        check(r.scan(tail_pruned).matched == oracle(columns[1], tail_pruned),
+              "partial zone pruning charges only visited groups");
+        check(uint64_t(r.sum_int64(1, {tail_pruned}).sum) ==
+                  sum_oracle(columns, 1, {tail_pruned}),
+              "partially pruned sum matches scalar oracle");
+    });
+    budget_rejects([&] { with_budget(pruned_bytes).scan(tail_pruned, false); });
+    const auto zero = with_budget(0);
+    const Predicate missing{1, Op::Between, int64_t(99), int64_t(100)};
+    check(zero.scan_all({}).matched == plain.size(), "zero budget permits metadata-only count");
+    check(zero.scan(missing).matched == 0, "zero budget permits fully pruned count");
+    check(zero.sum_int64(1, {missing}).sum == 0, "zero budget permits fully pruned sum");
+    budget_rejects([&] { zero.scan(missing, false); });
+    uint64_t first_column = 0;
+    for (const auto& g : bounded.groups()) first_column += g[1].bytes;
+    boundary(first_column, [&](const Reader& r) {
+        check(r.scan_all({missing, filters[1]}, false).matched == 0,
+              "empty selection avoids charging later predicate chunks");
+        check(r.sum_int64(0, {missing, filters[1]}, false).sum == 0,
+              "empty selection avoids charging projection");
+    });
+    throws([&] { zero.scan_all({missing, {99, Op::Equal, lo, lo}}); },
+           "validate predicates before budget/pruning");
+    throws([&] { zero.sum_int64(4); }, "validate projection before budget");
     auto expect_limit = [&](ReadLimits cap, const std::string& message) {
         bool rejected = false;
         try { Reader r(path, cap); }
@@ -519,6 +617,11 @@ void bounded_input_tests(const Scratch& scratch) {
     Reader empty(path, {1024, 0, 0});
     check(empty.scan_all({}).matched == 0, "zero row/chunk limits allow empty tables");
 
+    Reader empty_budget(path, {1024, 0, 0, 0, 0});
+    check(empty_budget.sum_int64(0).sum == 0, "empty sum needs no payload budget");
+    check(empty_budget.scan({0, Op::Equal, int64_t(0), int64_t(0)}).matched == 0,
+          "empty predicate scan needs no payload budget");
+
     auto save = [&](const std::string& bytes) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out.write(bytes.data(), std::streamsize(bytes.size()));
@@ -534,6 +637,14 @@ void bounded_input_tests(const Scratch& scratch) {
         check(Reader(path).rows() == UINT32_MAX, "default permits v1 compressed dimensions");
         expect_limit({1024, 1024, 64}, "group row limit exceeded");
     }
+    auto malformed_packed = packed_zero;
+    malformed_packed[8] = 65;
+    save(dimension_fixture(1, Encoding::BitPacked, malformed_packed));
+    const auto no_payload = with_budget(0);
+    budget_rejects([&] { no_payload.read_column(0, 0); });
+    budget_rejects([&] { no_payload.scan({0, Op::Equal, int64_t(0), int64_t(0)}, false); });
+    budget_rejects([&] { no_payload.sum_int64(0); });
+    throws([&] { Reader(path).read_column(0, 0); }, "permitted malformed payload still rejected");
     const auto valid = dimension_fixture(1, Encoding::BitPacked, packed_zero);
     save(valid);
     check(Reader(path, {1024, 9, 1}).read_column(0, 0) == Column(std::vector<int64_t>{0}),
