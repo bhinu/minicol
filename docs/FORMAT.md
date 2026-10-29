@@ -142,7 +142,8 @@ chunk in addition to the currently loaded predicate chunk.
 ## Resource limits and fuzzing
 
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
-max_decoded_string_bytes, max_payload_bytes_per_operation})`
+max_decoded_string_bytes, max_payload_bytes_per_operation,
+max_decoded_rows_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -203,7 +204,39 @@ processing, repeated decoding, metadata traversal, allocation overhead, and
 caller-retained results need separate budgets. Existing four-field limit
 initializers retain an unlimited per-operation payload budget.
 
-Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
+`max_decoded_rows_per_operation` is an inclusive cumulative budget for logical
+chunk rows per decoding pass in each `read_column`, `scan`, `scan_all`, or
+`sum_int64` call. Before loading a chunk for decoding, its full row count is
+subtracted from the remaining budget, with an overflow-safe check. An excess
+throws `std::runtime_error("operation decoded row limit exceeded")` before that
+payload allocation/read. For a retained shared predicate/projection chunk, a
+second row charge occurs before the summation decoding pass, without another
+payload-byte charge or file read. Earlier chunks may already have been decoded;
+no partial result is returned. Budgets reset on each call, including after a
+failure. Reader construction still validates metadata only.
+
+Each pass charges every row in the chunk, including unselected values and
+logical rows represented by dictionary IDs, RLE runs, or zero-width packing.
+Even an encoded RLE count charges the full represented row count. Repeated
+predicates on one column share one pass. Unfiltered sums charge the projected
+chunks once; shared predicate/sum projections charge twice when rows survive.
+Pruned chunks and chunks avoided by an empty selection consume no budget.
+Metadata-only counts and empty tables consume zero, so a zero budget permits
+them. All predicate/projection validation precedes charging. Row charges precede
+payload-byte charges and string-budget preflight; an exhausted row budget can
+therefore reject a malformed chunk without validating its payload. Predicate
+order and zone maps may affect whether an operation fits.
+
+This is a conservative logical row-work limit, not an instruction, elapsed-time,
+or process-memory limit. String preflight parsing is not a separate row charge;
+dictionary construction, string comparisons, predicate-list processing,
+selection intersection, metadata traversal, and per-row costs remain outside
+this accounting. Combine it with the byte, string, and group limits for
+untrusted inputs. Existing five-field initializers retain an unlimited row
+budget. Persisted format v1 is unchanged.
+
+Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, `UINT64_MAX`,
+and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit
@@ -214,7 +247,9 @@ dimension caps, not an exact allocation or runtime budget. Metadata allocations
 include all schema/group objects and copied strings in addition to the footer
 buffer. Without a decoded-string cap, dictionary and RLE strings can expand on
 materialization; decoded string storage can scale with group rows times encoded
-chunk bytes. Count/sum scans can visit all groups, and there is no total-row, total-file, decoded-row-work, or elapsed-time cap.
+chunk bytes. Count/sum scans can visit all groups, and there is no construction-time
+total-row, total-file, or elapsed-time cap. The optional per-operation decoded-row
+budget does not limit metadata traversal.
 The reader still validates payloads only when loaded and assumes immutable files.
 
 `make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the

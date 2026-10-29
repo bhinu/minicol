@@ -55,7 +55,13 @@ decoded string bytes per loaded chunk, respectively. An optional fifth field,
 `max_payload_bytes_per_operation`, caps cumulative encoded chunk bytes loaded by
 each read, count/AND scan, or sum call (excluding metadata). For example,
 `ReadLimits{1048576, 16777216, 65536, 16777216, 33554432}` adds a 32 MiB
-per-operation payload budget. Defaults retain all format-v1 dimensions. See
+per-operation payload budget.
+An optional sixth field, `max_decoded_rows_per_operation`, caps cumulative chunk
+rows per decoding pass in a read/scan/sum call. Shared predicate/sum chunks count
+twice because they are decoded twice; pruning avoids charges. For example,
+`ReadLimits{1048576, 16777216, 65536, 16777216, 33554432, 1000000}` also
+limits each call to one million logical row visits. Defaults retain all format-v1
+dimensions. See
 [resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
 validation boundaries and memory limitations.
 

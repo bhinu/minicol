@@ -667,6 +667,145 @@ void bounded_input_tests(const Scratch& scratch) {
         throws([&] { Reader r(path, {1024, 1024, 64}); }, "oversized footer dimension rejected");
     }
 }
+void decoded_row_budget_tests(const Scratch& scratch) {
+    const auto path = scratch.file("row-budget.mc");
+    const int64_t lo = INT64_MIN, hi = INT64_MAX;
+    constexpr size_t n = 2051, group_size = 1025;
+    std::vector<int64_t> plain(n), packed(n), runs(n);
+    std::vector<std::string> text(n), dict(n), text_runs(n);
+    for (size_t i = 0; i < n; ++i) {
+        plain[i] = i % 2 ? hi : lo;
+        packed[i] = int64_t(i % 31);
+        runs[i] = (i / 512) % 2 ? hi : lo;
+        text[i] = "unique-" + std::to_string(100000 + i);
+        dict[i] = "long-dictionary-value-" + std::to_string(i % 3);
+        text_runs[i] = std::string(40, char('a' + i / 512));
+    }
+    const std::vector<Column> columns{plain, packed, runs, text, dict, text_runs};
+    write_file(path, {{"plain", Type::Int64}, {"packed", Type::Int64}, {"runs", Type::Int64},
+                      {"text", Type::String}, {"dict", Type::String}, {"text_runs", Type::String}},
+               columns, {group_size, 256});
+    auto with_budget = [&](uint64_t rows) {
+        return Reader(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, UINT64_MAX, UINT64_MAX, rows});
+    };
+    auto rejects = [&](const std::function<void()>& operation) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) {
+            rejected = std::string(e.what()) == "operation decoded row limit exceeded";
+        }
+        check(rejected, "operation rejects with decoded row budget error");
+    };
+    auto boundary = [&](uint64_t rows, const std::function<void(const Reader&)>& operation) {
+        const auto exact = with_budget(rows);
+        operation(exact);
+        operation(exact);
+        const auto below = with_budget(rows - 1);
+        rejects([&] { operation(below); });
+        // Failure must not retain a partially consumed budget on the Reader.
+        check(below.scan_all({}).matched == n, "row budget failure permits metadata count");
+        check(below.read_column(2, 0) == Column(std::vector<int64_t>{plain.back()}),
+              "row budget resets after failed operation");
+    };
+    const std::vector<Encoding> encodings{Encoding::Plain, Encoding::BitPacked, Encoding::RLE,
+                                          Encoding::Plain, Encoding::Dictionary, Encoding::RLE};
+    const Reader unlimited(path);
+    for (size_t c = 0; c < columns.size(); ++c) {
+        check(unlimited.groups()[0][c].encoding == encodings[c], "row budget fixture codec");
+        for (size_t g = 0; g < unlimited.groups().size(); ++g) {
+            const size_t begin = g * group_size, end = std::min(n, begin + group_size);
+            const Column wanted = std::visit([&](const auto& v) -> Column {
+                using Vec = std::decay_t<decltype(v)>;
+                return Vec(v.begin() + begin, v.begin() + end);
+            }, columns[c]);
+            // A one-row tail uses a direct check: below-boundary budget is zero.
+            const auto exact = with_budget(end - begin);
+            check(exact.read_column(g, c) == wanted, "row budget source roundtrip");
+            rejects([&] { with_budget(end - begin - 1).read_column(g, c); });
+        }
+        const Value low = c < 3 ? Value(lo) : Value(std::string());
+        const Value high = c < 3 ? Value(hi) : Value(std::string(1, char(127)));
+        const Predicate all{c, Op::Between, low, high};
+        for (bool zones : {false, true}) {
+            boundary(n, [&](const Reader& r) {
+                check(r.scan(all, zones).matched == oracle(columns[c], all), "row budget scalar count");
+                check(r.scan_all({all, all}, zones).matched == oracle(columns[c], all),
+                      "repeated predicates decode each chunk once");
+            });
+            for (size_t projection : {size_t(0), size_t(1), size_t(2)}) {
+                boundary(2 * n, [&](const Reader& r) {
+                    const auto result = r.sum_int64(projection, {all}, zones);
+                    check(uint64_t(result.sum) == sum_oracle(columns, projection, {all}) &&
+                          result.scan.matched == conjunction_oracle(columns, {all}),
+                          "sum charges projection pass including retained chunks");
+                    uint64_t bytes = r.metadata_bytes();
+                    for (const auto& group : r.groups()) {
+                        bytes += group[c].bytes;
+                        if (c != projection) bytes += group[projection].bytes;
+                    }
+                    check(result.scan.bytes_read == bytes, "row charging preserves payload byte reuse");
+                });
+            }
+        }
+    }
+    const std::vector<Predicate> filters{{1, Op::Between, int64_t(0), int64_t(30)},
+                                         {4, Op::Equal, dict[1], std::string()}};
+    boundary(2 * n, [&](const Reader& r) {
+        check(r.scan_all(filters, false).matched == conjunction_oracle(columns, filters),
+              "row budget accumulates across AND columns and groups");
+    });
+    boundary(3 * n, [&](const Reader& r) {
+        check(uint64_t(r.sum_int64(0, filters, false).sum) == sum_oracle(columns, 0, filters),
+              "row budget accumulates across AND and projected sum");
+    });
+    boundary(n, [&](const Reader& r) {
+        check(uint64_t(r.sum_int64(0).sum) == sum_oracle(columns, 0, {}),
+              "unfiltered sum charges one pass per group");
+    });
+    const Predicate absent{1, Op::Equal, int64_t(99), int64_t(0)};
+    const auto zero = with_budget(0);
+    check(zero.scan_all({}).matched == n, "zero row budget permits metadata count");
+    check(zero.scan(absent).matched == 0 && zero.sum_int64(0, {absent}).sum == 0,
+          "zero row budget permits full zone pruning");
+    rejects([&] { zero.scan(absent, false); });
+    boundary(n, [&](const Reader& r) {
+        check(r.scan_all({absent, filters[1]}, false).matched == 0 &&
+              r.sum_int64(0, {absent, filters[1]}, false).sum == 0,
+              "empty selection avoids later decoding charges");
+    });
+    const Predicate last_group{3, Op::Equal, text.back(), std::string()};
+    check(with_budget(1).scan(last_group).matched == oracle(columns[3], last_group),
+          "partial pruning charges only surviving group rows");
+    throws([&] { zero.scan_all({absent, {99, Op::Equal, lo, lo}}); },
+           "invalid predicate checked before row budget");
+    throws([&] { zero.sum_int64(3); }, "invalid projection checked before row budget");
+
+    // Tiny compressed inputs must fail before expansion or payload validation.
+    for (Encoding codec : {Encoding::RLE, Encoding::BitPacked}) {
+        std::string payload;
+        if (codec == Encoding::RLE) {
+            append_le(payload, UINT32_MAX, 4);
+            append_le(payload, 0, 8);
+        } else payload.assign(9, char(0));
+        const auto fixture = dimension_fixture(UINT32_MAX, codec, payload);
+        { std::ofstream out(path, std::ios::binary); out.write(fixture.data(), std::streamsize(fixture.size())); }
+        const auto bounded = with_budget(64);
+        rejects([&] { bounded.read_column(0, 0); });
+        rejects([&] { bounded.scan({0, Op::Equal, int64_t(0), int64_t(0)}, false); });
+        rejects([&] { bounded.sum_int64(0); });
+        if (codec == Encoding::RLE)
+            check(with_budget(UINT32_MAX).scan({0, Op::Equal, int64_t(0), int64_t(0)}).matched == UINT32_MAX,
+                  "encoded RLE count charges logical rows at exact 64-bit boundary");
+    }
+    auto malformed = dimension_fixture(1, Encoding::BitPacked, std::string(9, char(0)));
+    malformed[24] = 65;
+    { std::ofstream out(path, std::ios::binary); out.write(malformed.data(), std::streamsize(malformed.size())); }
+    rejects([&] { with_budget(0).read_column(0, 0); });
+    throws([&] { with_budget(1).read_column(0, 0); }, "permitted malformed chunk still rejected");
+    write_file(path, {{"empty", Type::Int64}}, {std::vector<int64_t>{}});
+    check(with_budget(0).scan_all({}).matched == 0 && with_budget(0).sum_int64(0).sum == 0,
+          "empty table consumes no decoded rows");
+}
 void decoded_string_budget_tests(const Scratch& scratch) {
     const auto path = scratch.file("string-budget.mc");
     for (Encoding codec : {Encoding::Plain, Encoding::Dictionary, Encoding::RLE}) {
@@ -800,6 +939,7 @@ int main() {
         conjunction_tests(scratch);
         aggregate_tests(scratch);
         bounded_input_tests(scratch);
+        decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);

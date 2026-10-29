@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input caps, decoded-string caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -229,3 +229,46 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   regression cases for findings. Streaming writes and bounded-memory reads
   remain the next larger feature; checksums, expanded benchmarks, and profiling
   remain later roadmap items.
+
+## Per-operation decoded-row budgets — 2026-10-29
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_decoded_rows_per_operation`, an inclusive cumulative cap on
+  logical chunk rows per decoding pass in each read/count/AND/sum call. Charge
+  whole chunks before payload allocation/read using overflow-safe subtraction;
+  shared predicate/sum projections charge a second pass before summation while
+  retaining the existing one-read payload accounting. Defaults and existing
+  initializers remain unlimited; format v1 and dependencies are unchanged.
+- Pruning and empty selections avoid charges, repeated-column predicates share
+  one pass, and each call resets its budget even after failure. Encoded RLE
+  counts charge represented rows despite avoiding expansion. README.md and
+  FORMAT.md document semantics, error precedence, and accounting limitations.
+- Release tests pass 6,693 checks (`make test`, `-O3 -DNDEBUG`). New independent
+  source/scalar-oracle tests cover all six codec/type combinations, exact and
+  one-below limits, multiple groups and batch/group tails, repeated calls,
+  multi-column ANDs, separate/shared projections, wrapping sums, full/partial
+  pruning, early termination, empty tables, and malformed payloads. Independently
+  constructed tiny RLE/zero-width chunks advertising `UINT32_MAX` rows reject
+  before decoding with a small budget; encoded RLE counts pass at the exact
+  represented-row boundary.
+- Sanitizers: `make sanitize` reached this environment's documented LeakSanitizer
+  fatal error under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed
+  all 6,693 checks with address and undefined-behavior sanitizers active; leak
+  detection remains unverified here. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-row-budget-2026-10-29`.
+  All five existing count workloads and three methods agreed with the row-store
+  baseline. All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-row-budget-2026-10-29.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-row-budget-2026-10-29-environment.txt).
+  This smoke uses unlimited defaults and makes no performance claim; earlier
+  evidence remains unchanged.
+- Remaining: metadata/predicate traversal and full allocation budgets, longer
+  fuzz campaigns and regression cases for findings. The row budget bounds
+  logical decoding passes, not CPU instructions, elapsed time, or process memory;
+  string preflight, dictionary construction, comparisons, selection intersection,
+  and caller-retained data still need separate accounting. Streaming writes and
+  bounded-memory reads remain the next larger feature; checksums, expanded
+  benchmarks, and profiling remain later items.
