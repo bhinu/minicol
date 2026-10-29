@@ -30,6 +30,8 @@ struct ReadLimits {
  uint64_t max_metadata_entries=UINT64_MAX;
  // Predicates per scan/AND/sum call, checked before validation and grouping.
  uint64_t max_predicates_per_operation=UINT64_MAX;
+ // Zone-map and payload predicate evaluations per scan/AND/sum call.
+ uint64_t max_predicate_evaluations_per_operation=UINT64_MAX;
 };
 void write_file(const std::string& path, const std::vector<Field>& schema, const std::vector<Column>& columns, WriteOptions options={});
 class Reader {
@@ -54,6 +56,7 @@ private:
  uint64_t max_payload_bytes_per_operation_=UINT64_MAX;
  uint64_t max_decoded_rows_per_operation_=UINT64_MAX;
  uint64_t max_predicates_per_operation_=UINT64_MAX;
+ uint64_t max_predicate_evaluations_per_operation_=UINT64_MAX;
 };
 const char* encoding_name(Encoding encoding);
 }

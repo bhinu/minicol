@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate caps, metadata-entry caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate-count/evaluation caps, metadata-entry caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -356,3 +356,44 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   vectors/strings, total comparisons over all rows/groups, CPU time, or process
   memory. Streaming writes and bounded-memory reads remain the next larger
   feature; checksums, expanded benchmarks, and profiling remain later items.
+
+## Per-operation predicate-evaluation budgets — 2026-10-29
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_predicate_evaluations_per_operation`, an inclusive cumulative
+  budget covering zone-map checks and payload predicate evaluations. Charge
+  immediately before each check and throw on exhaustion without a partial
+  result. Plain/packed rows, dictionary entries, and RLE runs charge per predicate
+  actually evaluated; bypassed predicates consume nothing. Summation's projection
+  pass consumes no evaluations. Defaults and existing eight-field initializers
+  remain unlimited; dependencies and persisted format v1 are unchanged.
+- Documented exact accounting, validation order, per-call resets, predicate-order
+  and encoding effects, zero-budget behavior, and limitations in README.md and
+  FORMAT.md. This caps evaluation count, not string bytes compared, decoding,
+  allocation, elapsed time, or process memory; combine it with existing limits.
+- `make test` passed 12,705 checks in the release build (`-O3 -DNDEBUG`). New
+  source-based evaluation counts and independent scalar count/AND/wrapping-sum
+  oracles cover all six codec/type combinations, exact/one-below/zero budgets,
+  repeated predicates/calls, multiple groups and batch/group tails, embedded NULs,
+  integer extremes, shared/separate projections, reversed predicates, selective
+  short-circuiting, full pruning, early termination, empty tables/queries,
+  validation precedence, and malformed payloads with a sufficient finite budget.
+- `make sanitize` reached the environment's documented LeakSanitizer fatal error
+  under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all 12,705
+  checks with address and undefined-behavior sanitizers active; leak detection
+  remains unverified here. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-evaluation-budget-2026-10-29`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-evaluation-budget-2026-10-29.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical-byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-evaluation-budget-2026-10-29-environment.txt).
+  This smoke uses unlimited defaults and makes no performance claim; earlier
+  benchmark evidence remains unchanged.
+- Remaining: string-comparison byte budgets, exact allocation accounting, longer
+  fuzz campaigns and regression cases for findings. Dictionary construction,
+  metadata traversal, selection intersection, and aggregation still need separate
+  work accounting. Streaming writes and bounded-memory reads remain the next
+  larger feature; checksums, expanded benchmarks, and profiling remain later items.

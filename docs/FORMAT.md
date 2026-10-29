@@ -144,7 +144,7 @@ chunk in addition to the currently loaded predicate chunk.
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
 max_decoded_string_bytes, max_payload_bytes_per_operation,
 max_decoded_rows_per_operation, max_metadata_entries,
-max_predicates_per_operation})`
+max_predicates_per_operation, max_predicate_evaluations_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -280,8 +280,43 @@ total comparisons across rows/groups, elapsed time, or process memory. Combine
 it with the other limits for untrusted queries. Existing seven-field initializers
 keep an unlimited predicate cap; format v1 is unchanged.
 
+`max_predicate_evaluations_per_operation` is an inclusive cumulative budget for
+predicate evaluations in one `scan`, `scan_all`, or `sum_int64` call. Each
+zone-map predicate check costs one, including checks that prune a group. Payload
+filtering costs one per predicate actually tested against a plain/packed row,
+dictionary entry (including unused entries), or RLE run. A range test costs one,
+even though it can compare both bounds. Duplicates count separately. Same-column
+AND evaluation stops at the first false predicate, and zone-map checks stop at
+the first excluded predicate; predicates bypassed this way cost nothing.
+Evaluations of later columns avoided by an empty selection also cost nothing.
+Predicate order, encoding, and enabling zone maps can therefore change the budget
+needed, including when the query's result is unchanged.
+
+Immediately before each evaluation, an exhausted budget throws
+`std::runtime_error("operation predicate evaluation limit exceeded")`; no partial
+result is returned. Earlier payloads may have been read/decoded. Budgets reset
+on every call, including after failures. All predicate/projection validation and
+the predicate-count check still precede evaluation. Zone checks occur before
+payload work; payload evaluations occur after the applicable row/payload/string
+budget checks and decoder setup. This is not a payload preflight: malformed
+payloads may fail before budget exhaustion, and exhaustion may prevent later
+structural validation. Default unlimited calls retain their validation behavior.
+
+An empty table, empty conjunction count, unfiltered sum, and `read_column` use
+no evaluations. Summation's projection pass uses none, including a retained
+predicate/projection chunk decoded again. A zero budget permits these operations,
+but rejects even a fully pruned nonempty scan at its first zone-map check.
+Existing eight-field initializers retain an unlimited evaluation budget; persisted
+format v1 is unchanged.
+
+This bounds predicate checks, not individual comparisons, string bytes compared,
+CPU instructions, elapsed time, or memory. Decoding, dictionary construction,
+metadata traversal, selection intersection, and aggregation need separate
+accounting. Combine this cap with the existing input and operation limits;
+a small evaluation budget alone does not bound payload allocation or expansion.
+
 Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, `UINT64_MAX`,
-`UINT64_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
+`UINT64_MAX`, `UINT64_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit

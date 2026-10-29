@@ -74,6 +74,13 @@ for example `ReadLimits limits; limits.max_predicates_per_operation = 64;`, then
 pass `limits` to the Reader constructor. Duplicate predicates count separately;
 zero permits empty conjunctions and unfiltered sums. Defaults remain unlimited.
 
+A ninth field, `max_predicate_evaluations_per_operation`, caps predicate checks
+across zone maps and loaded payloads in each count/AND/sum call. Set it by name,
+for example `limits.max_predicate_evaluations_per_operation = 1000000;`.
+Dictionary entries and RLE runs count once per predicate actually evaluated;
+plain/packed values count per row. Short-circuited predicates consume nothing.
+This bounds evaluation count, not string comparison bytes or elapsed time.
+
 ## Evidence and boundaries
 
 An hourly GitHub-hosted development worker is active and its first generation, validation, and commit-push run passed. Linux/macOS correctness CI also passed. The previous local hourly automation is paused. See [cloud runner setup, controls, and evidence](docs/CLOUD_RUNNER.md).

@@ -767,6 +767,155 @@ void predicate_limit_tests(const Scratch& scratch) {
         }
     }
 }
+void predicate_evaluation_budget_tests(const Scratch& scratch) {
+    const auto path = scratch.file("predicate-evaluations.mc");
+    auto limited = [&](uint64_t budget) {
+        ReadLimits limits;
+        limits.max_predicate_evaluations_per_operation = budget;
+        return Reader(path, limits);
+    };
+    auto rejects_with = [&](const std::function<void()>& operation, const std::string& error) {
+        bool caught = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) { caught = e.what() == error; }
+        check(caught, "evaluation budget error: " + error);
+    };
+    const std::string exhausted = "operation predicate evaluation limit exceeded";
+    const size_t n = 3077, group_size = 1025;
+    std::vector<int64_t> plain(n), packed(n), runs(n);
+    std::vector<std::string> text(n), dict(n), text_runs(n);
+    for (size_t i = 0; i < n; ++i) {
+        plain[i] = i % 2 ? INT64_MAX : INT64_MIN;
+        packed[i] = int64_t(i % 31) - 15;
+        runs[i] = (i / 256) % 2 ? INT64_MAX : INT64_MIN;
+        text[i] = "unique-" + std::to_string(i) + std::string("\0tail", 5);
+        dict[i] = std::string("dictionary\0entry-", 17) + std::to_string(i % 3);
+        text_runs[i] = std::string(40, char('a' + i / 256));
+    }
+    const std::vector<Column> columns{plain, packed, runs, text, dict, text_runs};
+    write_file(path, {{"plain", Type::Int64}, {"packed", Type::Int64}, {"runs", Type::Int64},
+                      {"text", Type::String}, {"dict", Type::String}, {"text_runs", Type::String}},
+               columns, {group_size, group_size});
+    const Reader source(path);
+    const std::vector<Encoding> codecs{Encoding::Plain, Encoding::BitPacked, Encoding::RLE,
+                                       Encoding::Plain, Encoding::Dictionary, Encoding::RLE};
+    std::vector<Predicate> all;
+    std::vector<uint64_t> units(columns.size(), 0);
+    // Count expected evaluation sites from the source values, never a payload decoder.
+    for (size_t c = 0; c < columns.size(); ++c) {
+        check(source.groups()[0][c].encoding == codecs[c], "evaluation fixture codec");
+        all.push_back(std::visit([&](const auto& values) {
+            const auto bounds = std::minmax_element(values.begin(), values.end());
+            return Predicate{c, Op::Between, Value(*bounds.first), Value(*bounds.second)};
+        }, columns[c]));
+        for (size_t g = 0; g < source.groups().size(); ++g) {
+            std::visit([&](const auto& values) {
+                const auto begin = values.begin() + g * group_size;
+                const auto end = begin + source.groups()[g][c].rows;
+                const auto codec = source.groups()[g][c].encoding;
+                if (codec == Encoding::RLE) {
+                    ++units[c];
+                    for (auto it = begin + 1; it != end; ++it) units[c] += *it != *(it - 1);
+                } else if (codec == Encoding::Dictionary) {
+                    auto distinct = std::vector<typename std::decay_t<decltype(values)>::value_type>(begin, end);
+                    std::sort(distinct.begin(), distinct.end());
+                    units[c] += std::unique(distinct.begin(), distinct.end()) - distinct.begin();
+                } else units[c] += end - begin;
+            }, columns[c]);
+        }
+        for (size_t duplicates : {size_t(1), size_t(3)}) for (bool zones : {false, true}) {
+            const std::vector<Predicate> query(duplicates, all.back());
+            const auto budget = duplicates * (units[c] + (zones ? source.groups().size() : 0));
+            const auto exact = limited(budget);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                const auto result = exact.scan_all(query, zones);
+                check(result.matched == conjunction_oracle(columns, query), "exact evaluation count oracle");
+                const auto sum = exact.sum_int64(0, query, zones);
+                check(sum.scan.matched == result.matched && uint64_t(sum.sum) == sum_oracle(columns, 0, query),
+                      "exact evaluation sum oracle, including shared projection");
+            }
+            if (duplicates == 1)
+                check(exact.scan(query.front(), zones).matched == oracle(columns[c], query.front()),
+                      "single scan evaluation budget");
+            const auto below = limited(budget - 1);
+            rejects_with([&] { below.scan_all(query, zones); }, exhausted);
+            rejects_with([&] { below.sum_int64(0, query, zones); }, exhausted);
+            check(below.scan_all({}).matched == n, "evaluation state resets after failure");
+        }
+    }
+    for (bool zones : {false, true}) {
+        uint64_t budget = zones ? all.size() * source.groups().size() : 0;
+        for (auto count : units) budget += count;
+        const auto exact = limited(budget);
+        for (int order = 0; order < 2; ++order) {
+            auto query = all;
+            if (order) std::reverse(query.begin(), query.end());
+            check(exact.scan_all(query, zones).matched == conjunction_oracle(columns, query),
+                  "multi-column evaluation count oracle");
+            for (size_t projection : {size_t(0), size_t(1), size_t(2)}) {
+                const auto result = exact.sum_int64(projection, query, zones);
+                check(result.scan.matched == conjunction_oracle(columns, query) &&
+                      uint64_t(result.sum) == sum_oracle(columns, projection, query),
+                      "multi-column evaluation sum oracle");
+            }
+        }
+        rejects_with([&] { limited(budget - 1).scan_all(all, zones); }, exhausted);
+        rejects_with([&] { limited(budget - 1).sum_int64(1, all, zones); }, exhausted);
+    }
+    for (size_t c = 0; c < columns.size(); ++c) for (bool zones : {false, true}) {
+        const Predicate reversed{c, Op::Between, all[c].high, all[c].low};
+        const std::vector<Predicate> query{reversed, all[c], all[(c + 1) % columns.size()]};
+        const uint64_t budget = zones ? source.groups().size() : units[c];
+        const auto exact = limited(budget);
+        check(exact.scan_all(query, zones).matched == conjunction_oracle(columns, query),
+              "every codec short-circuits later predicates");
+        check(uint64_t(exact.sum_int64(0, query, zones).sum) == sum_oracle(columns, 0, query),
+              "every codec short-circuits sum predicates");
+        rejects_with([&] { limited(budget - 1).scan_all(query, zones); }, exhausted);
+    }
+    const Predicate absent{1, Op::Equal, int64_t(999), std::string("ignored")};
+    for (bool zones : {false, true}) {
+        // Failure on the first predicate skips the remaining checks and later columns.
+        const uint64_t budget = zones ? source.groups().size() : units[1];
+        const std::vector<Predicate> query{absent, all[1], all[4]};
+        const auto exact = limited(budget);
+        check(exact.scan_all(query, zones).matched == conjunction_oracle(columns, query),
+              "short-circuit evaluation count oracle");
+        check(uint64_t(exact.sum_int64(0, query, zones).sum) == sum_oracle(columns, 0, query),
+              "short-circuit evaluation sum oracle");
+        rejects_with([&] { limited(budget - 1).scan_all(query, zones); }, exhausted);
+    }
+    const Predicate maximum{0, Op::Equal, int64_t(INT64_MAX), std::string()};
+    for (bool zones : {false, true}) for (bool reversed : {false, true}) {
+        std::vector<Predicate> query{maximum, all[0]};
+        if (reversed) std::reverse(query.begin(), query.end());
+        const uint64_t budget = n + (reversed ? n : oracle(columns[0], maximum)) +
+                                (zones ? 2 * source.groups().size() : 0);
+        const auto exact = limited(budget);
+        check(exact.scan_all(query, zones).matched == conjunction_oracle(columns, query),
+              "selective predicates charge only reached checks, in either order");
+        check(uint64_t(exact.sum_int64(0, query, zones).sum) == sum_oracle(columns, 0, query),
+              "selective shared projection budget and wrapping sum oracle");
+        rejects_with([&] { limited(budget - 1).scan_all(query, zones); }, exhausted);
+    }
+    const auto zero = limited(0);
+    conjunctions(zero, columns, {});
+    check(zero.read_column(0, 1) == Column(std::vector<int64_t>(packed.begin(), packed.begin() + group_size)),
+          "materialization uses no predicate evaluations");
+    rejects_with([&] { zero.scan(absent); }, exhausted);
+    rejects_with([&] { zero.scan({0, Op::Equal, std::string(), int64_t(0)}); }, "predicate type mismatch");
+    rejects_with([&] { zero.scan_all({absent, {1, Op(99), int64_t(0), int64_t(0)}}); },
+                 "invalid predicate operation");
+    rejects_with([&] { zero.sum_int64(3, {absent}); }, "sum requires integer column");
+    // A finite budget must not hide malformed loaded payloads when it suffices.
+    { std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+      file.seekp(std::streamoff(source.groups()[0][1].offset + 8)); file.put(char(65)); }
+    rejects_with([&] { limited(UINT64_MAX).scan(all[1], false); }, "invalid packed data");
+    rejects_with([&] { limited(units[1]).scan(all[1], false); }, "invalid packed data");
+    // Empty tables evaluate nothing, even with supplied predicates and zone maps.
+    write_file(path, {{"v", Type::Int64}}, {std::vector<int64_t>{}});
+    conjunctions(limited(0), {std::vector<int64_t>{}}, {{0, Op::Equal, int64_t(1), int64_t(0)}});
+}
 void metadata_entry_limit_tests(const Scratch& scratch) {
     const auto path = scratch.file("metadata-limit.mc");
     auto limits = [](uint64_t entries) {
@@ -1130,6 +1279,7 @@ int main() {
         aggregate_tests(scratch);
         bounded_input_tests(scratch);
         predicate_limit_tests(scratch);
+        predicate_evaluation_budget_tests(scratch);
         metadata_entry_limit_tests(scratch);
         decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);
