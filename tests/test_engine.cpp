@@ -667,6 +667,106 @@ void bounded_input_tests(const Scratch& scratch) {
         throws([&] { Reader r(path, {1024, 1024, 64}); }, "oversized footer dimension rejected");
     }
 }
+void predicate_limit_tests(const Scratch& scratch) {
+    const auto path = scratch.file("predicate-limit.mc");
+    auto limited = [&](uint64_t count) {
+        ReadLimits cap;
+        cap.max_predicates_per_operation = count;
+        return Reader(path, cap);
+    };
+    auto rejects_with = [&](const std::function<void()>& operation, const std::string& message) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) { rejected = e.what() == message; }
+        check(rejected, "predicate limit error: " + message);
+    };
+    const std::string limit_error = "operation predicate limit exceeded";
+    for (size_t rows : {size_t(0), size_t(2051)}) {
+        std::vector<int64_t> plain(rows), packed(rows), runs(rows);
+        std::vector<std::string> text(rows), dict(rows), text_runs(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            plain[i] = i % 2 ? INT64_MAX : INT64_MIN;
+            packed[i] = int64_t(i % 31) - 15;
+            runs[i] = (i / 256) % 2 ? INT64_MAX : INT64_MIN;
+            text[i] = "unique-" + std::to_string(i);
+            dict[i] = std::string("dictionary\0entry-", 17) + std::to_string(i % 3);
+            text_runs[i] = std::string(40, char('a' + i / 256));
+        }
+        const std::vector<Column> columns{plain, packed, runs, text, dict, text_runs};
+        write_file(path, {{"plain", Type::Int64}, {"packed", Type::Int64}, {"runs", Type::Int64},
+                          {"text", Type::String}, {"dict", Type::String}, {"text_runs", Type::String}},
+                   columns, {1024, 1024});
+        const std::vector<Predicate> filters{
+            {0, Op::Equal, int64_t(INT64_MAX), std::string("ignored")},
+            {1, Op::Between, int64_t(-8), int64_t(9)},
+            {2, Op::Between, int64_t(INT64_MIN), int64_t(INT64_MAX)},
+            {3, Op::Between, std::string("unique-1"), std::string("unique-9")},
+            {4, Op::Equal, std::string("dictionary\0entry-1", 18), std::string()},
+            {5, Op::Between, std::string(40, 'a'), std::string(40, 'z')}};
+        if (rows) {
+            const auto reader = limited(6);
+            const std::vector<Encoding> codecs{Encoding::Plain, Encoding::BitPacked, Encoding::RLE,
+                                               Encoding::Plain, Encoding::Dictionary, Encoding::RLE};
+            for (size_t c = 0; c < codecs.size(); ++c)
+                check(reader.groups()[0][c].encoding == codecs[c], "predicate-limit fixture codec");
+        }
+        scans(limited(1), columns, filters);
+        for (size_t n = 0; n <= filters.size(); ++n) {
+            const std::vector<Predicate> query(filters.begin(), filters.begin() + n);
+            const auto exact = limited(n);
+            conjunctions(exact, columns, query);
+            if (n) {
+                const auto below = limited(n - 1);
+                for (bool zones : {false, true}) {
+                    rejects_with([&] { below.scan_all(query, zones); }, limit_error);
+                    rejects_with([&] { below.sum_int64(0, query, zones); }, limit_error);
+                }
+                // Rejections do not retain operation state.
+                conjunctions(below, columns, {});
+            }
+        }
+        const std::vector<Predicate> duplicates(64, filters[1]);
+        conjunctions(limited(64), columns, duplicates);
+        const auto below = limited(63);
+        rejects_with([&] { below.scan_all(duplicates); }, limit_error);
+        rejects_with([&] { below.sum_int64(1, duplicates); }, limit_error);
+        // Existing seven-field initializers and defaults retain unlimited counts.
+        conjunctions(Reader(path), columns, duplicates);
+        conjunctions(Reader(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, UINT64_MAX,
+                                  UINT64_MAX, UINT64_MAX, UINT64_MAX}), columns, duplicates);
+        const auto zero = limited(0);
+        for (const auto& p : filters) {
+            rejects_with([&] { zero.scan(p); }, limit_error);
+            rejects_with([&] { zero.scan_all({p}); }, limit_error);
+            rejects_with([&] { zero.sum_int64(0, {p}); }, limit_error);
+        }
+        const Predicate missing{1, Op::Equal, int64_t(100), int64_t(0)};
+        rejects_with([&] { zero.scan_all({missing}); }, limit_error);
+        const Predicate invalid{99, Op::Equal, int64_t(0), int64_t(0)};
+        // Count check precedes predicate validation, even on empty/pruned tables.
+        rejects_with([&] { zero.scan_all({invalid}); }, limit_error);
+        rejects_with([&] { zero.sum_int64(0, {invalid}); }, limit_error);
+        rejects_with([&] { limited(1).scan_all({missing, invalid}); }, limit_error);
+        throws([&] { limited(2).scan_all({missing, invalid}); },
+               "within-cap later predicates validated before pruning");
+        throws([&] { limited(1).scan(invalid); }, "accepted count still validates columns");
+        throws([&] { limited(1).scan({0, Op(99), int64_t(0), int64_t(0)}); },
+               "accepted count still validates operations");
+        rejects_with([&] { limited(1).scan({0, Op::Equal, std::string(), int64_t(0)}); },
+                     "predicate type mismatch");
+        rejects_with([&] { zero.sum_int64(3, {invalid}); }, "sum requires integer column");
+        // Projection validation retains precedence over the predicate count cap.
+        bool bad_projection = false;
+        try { zero.sum_int64(99, {invalid}); }
+        catch (const std::out_of_range&) { bad_projection = true; }
+        check(bad_projection, "projection column validated before predicate limit");
+        conjunctions(zero, columns, {});
+        if (rows) {
+            check(zero.read_column(0, 1) == Column(std::vector<int64_t>(packed.begin(), packed.begin() + 1024)),
+                  "zero predicate limit does not restrict materialization");
+        }
+    }
+}
 void metadata_entry_limit_tests(const Scratch& scratch) {
     const auto path = scratch.file("metadata-limit.mc");
     auto limits = [](uint64_t entries) {
@@ -1029,6 +1129,7 @@ int main() {
         conjunction_tests(scratch);
         aggregate_tests(scratch);
         bounded_input_tests(scratch);
+        predicate_limit_tests(scratch);
         metadata_entry_limit_tests(scratch);
         decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);

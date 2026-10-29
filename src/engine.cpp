@@ -110,7 +110,7 @@ void write_file(const std::string& path,const std::vector<Field>& schema,const s
  for(size_t begin=0;begin<rows;){uint32_t n=uint32_t(std::min<size_t>(options.row_group_size,rows-begin));std::vector<ChunkMeta> group;for(size_t ci=0;ci<schema.size();++ci){ChunkMeta m;m.rows=n;m.offset=uint64_t(out.tellp());auto e=encode(columns[ci],begin,n,options.sample_size,m.min,m.max);m.encoding=e.encoding;m.bytes=e.bytes.size();emit(out,e.bytes);group.push_back(std::move(m));}groups.push_back(std::move(group));begin+=n;}
  Bytes footer;put(footer,rows,8);put(footer,schema.size(),4);put(footer,groups.size(),4);for(auto& f:schema){str(footer,f.name);put(footer,unsigned(f.type),1);}for(auto& g:groups)for(auto& m:g){put(footer,m.rows,4);put(footer,unsigned(m.encoding),1);put(footer,m.offset,8);put(footer,m.bytes,8);value(footer,m.min);value(footer,m.max);}emit(out,footer);Bytes tail;put(tail,footer.size(),8);const char* magic="MCOLEND1";tail.insert(tail.end(),magic,magic+8);emit(out,tail);out.flush();if(!out)bad("file flush failed");out.close();if(!out)bad("file close failed");
 }
-Reader::Reader(const std::string& path,ReadLimits limits):path_(path),max_decoded_string_bytes_(limits.max_decoded_string_bytes),max_payload_bytes_per_operation_(limits.max_payload_bytes_per_operation),max_decoded_rows_per_operation_(limits.max_decoded_rows_per_operation) {
+Reader::Reader(const std::string& path,ReadLimits limits):path_(path),max_decoded_string_bytes_(limits.max_decoded_string_bytes),max_payload_bytes_per_operation_(limits.max_payload_bytes_per_operation),max_decoded_rows_per_operation_(limits.max_decoded_rows_per_operation),max_predicates_per_operation_(limits.max_predicates_per_operation) {
  std::ifstream in(path,std::ios::binary|std::ios::ate);if(!in)bad("cannot open file");auto end=in.tellg();if(end<32)bad("file too short");uint64_t size=uint64_t(end);auto h=load(in,0,16);if(std::memcmp(h.data(),"MINICOL1",8))bad("invalid file magic");Cursor hc{h,8};if(hc.get(4)!=1)bad("unsupported format version");auto group_size=hc.get(4);if(!group_size)bad("invalid row group size");auto t=load(in,size-16,16);if(std::memcmp(t.data()+8,"MCOLEND1",8))bad("invalid trailer");Cursor tc{t};auto fl=tc.get(8);if(fl>size-32||fl<16)bad("invalid footer size");if(fl>limits.max_footer_bytes)bad("footer byte limit exceeded");auto b=load(in,size-16-fl,fl);Cursor c{b};rows_=c.get(8);auto nc=c.get(4),ng=c.get(4);if(!nc||nc>(b.size()-c.p)/5||ng!=(rows_/group_size+(rows_%group_size!=0)))bad("invalid schema/group count");if(std::min<uint64_t>(rows_,group_size)>limits.max_group_rows)bad("group row limit exceeded");
  // nc and ng are uint32 fields: nc * (ng + 1) fits in uint64, even at their maxima.
  // Count schema and chunk objects before parsing names or constructing metadata.
@@ -136,6 +136,7 @@ SumResult Reader::sum_int64(size_t column,const std::vector<Predicate>& predicat
  return scan_impl(predicates,zones,&column);
 }
 SumResult Reader::scan_impl(const std::vector<Predicate>& predicates,bool zones,const size_t* projection) const {
+ if(predicates.size()>max_predicates_per_operation_)bad("operation predicate limit exceeded");
  // Validate every predicate before pruning or short-circuiting any payload reads.
  std::vector<size_t> columns;
  std::vector<std::vector<const Predicate*>> by_column;

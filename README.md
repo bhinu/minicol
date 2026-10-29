@@ -68,6 +68,11 @@ also permits at most 10,000 combined schema/chunk entries. This is an object-cou
 limit; pair it with the footer-byte cap to bound encoded metadata strings. See
 [resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
 validation boundaries and memory limitations.
+An eighth field, `max_predicates_per_operation`, caps the number of predicates
+in each count/AND/sum call before predicate validation or grouping. Set it by name,
+for example `ReadLimits limits; limits.max_predicates_per_operation = 64;`, then
+pass `limits` to the Reader constructor. Duplicate predicates count separately;
+zero permits empty conjunctions and unfiltered sums. Defaults remain unlimited.
 
 ## Evidence and boundaries
 

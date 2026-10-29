@@ -143,7 +143,8 @@ chunk in addition to the currently loaded predicate chunk.
 
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
 max_decoded_string_bytes, max_payload_bytes_per_operation,
-max_decoded_rows_per_operation, max_metadata_entries})`
+max_decoded_rows_per_operation, max_metadata_entries,
+max_predicates_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -260,8 +261,27 @@ The footer buffer has already been loaded; combine this cap with
 Vector capacity, object overhead, temporary copies, and caller-retained Readers
 still prevent an exact process-memory guarantee.
 
+`max_predicates_per_operation` is an inclusive cap on the supplied predicate
+count in each `scan`, `scan_all`, or `sum_int64` call. Every predicate counts,
+including duplicates, repeated columns, contradictions, and conditions that
+could prune every group. A single `scan` counts one. Before validating predicate
+columns/operations/types, constructing grouping vectors, opening the payload
+file, or traversing groups, an excess throws
+`std::runtime_error("operation predicate limit exceeded")`. Sum projection
+validation still happens first. Within the cap, all predicates retain their
+normal validation before pruning. The cap applies to empty tables too.
+
+Zero permits metadata-only empty conjunction counts and unfiltered sums;
+`read_column` is unaffected. The cap is per call, with no cumulative Reader
+state, including after failures. It does not bound caller allocations for the
+predicate vector/strings or the temporary single-predicate copy made by `scan`.
+It bounds list length and internal grouping work, not string comparison bytes,
+total comparisons across rows/groups, elapsed time, or process memory. Combine
+it with the other limits for untrusted queries. Existing seven-field initializers
+keep an unlimited predicate cap; format v1 is unchanged.
+
 Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, `UINT64_MAX`,
-`UINT64_MAX`, and `UINT64_MAX`:
+`UINT64_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit

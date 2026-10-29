@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row caps, metadata-entry caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate caps, metadata-entry caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -318,3 +318,41 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   or exact memory; the footer is already loaded before the count check.
   Streaming writes and bounded-memory reads remain the next larger feature;
   checksums, expanded benchmarks, and profiled optimizations remain later items.
+
+## Per-operation predicate-count limits — 2026-10-29
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_predicates_per_operation`, an inclusive cap on supplied
+  predicates in each count/AND/sum call. Reject oversized lists before predicate
+  validation, grouping allocations, payload opening, or group traversal.
+  Duplicates count separately, even when they share a column or could prune all
+  groups. Sum projection validation retains precedence. Defaults and existing
+  seven-field initializers remain unlimited; dependencies and format v1 are
+  unchanged. README.md and FORMAT.md document usage and exact boundaries.
+- Release tests pass 12,402 checks (`make test`, `-O3 -DNDEBUG`). New independent
+  scalar count/AND/wrapping-sum oracle comparisons cover all six codec/type
+  combinations, multiple groups and a short tail, embedded NULs, integer
+  extremes, exact/one-below/zero caps, 64 duplicate predicates, predicate
+  reversal, empty tables/queries, and repeated calls after rejection. Tests also
+  cover validation precedence, pruning-independent rejection, unchanged
+  materialization, and compatibility with defaults and older initializers.
+- Sanitizers: `make sanitize` reached the documented LeakSanitizer fatal error
+  under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all 12,402
+  checks with address and undefined-behavior sanitizers active; leak detection
+  remains unverified in this environment. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-predicate-limit-2026-10-29`.
+  All five existing count workloads and three methods agreed with the row-store
+  baseline. All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-predicate-limit-2026-10-29.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-predicate-limit-2026-10-29-environment.txt).
+  This smoke uses unlimited defaults and makes no performance claim; earlier
+  benchmark evidence remains unchanged.
+- Remaining: comparison/string-byte work limits, exact allocation accounting,
+  longer fuzz campaigns and regression cases for findings. The predicate cap
+  bounds list length and internal grouping work, not caller-owned predicate
+  vectors/strings, total comparisons over all rows/groups, CPU time, or process
+  memory. Streaming writes and bounded-memory reads remain the next larger
+  feature; checksums, expanded benchmarks, and profiling remain later items.
