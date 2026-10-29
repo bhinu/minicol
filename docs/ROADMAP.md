@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row caps, metadata-entry caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -272,3 +272,49 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   and caller-retained data still need separate accounting. Streaming writes and
   bounded-memory reads remain the next larger feature; checksums, expanded
   benchmarks, and profiling remain later items.
+
+## Metadata-entry construction limits — 2026-10-29
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_metadata_entries`, an inclusive construction-time cap on
+  schema fields plus chunk metadata entries: `columns * (groups + 1)`.
+  Check the uint64 count before parsing schema names or constructing metadata
+  objects, including for empty tables and groups later pruned by queries.
+  Defaults and existing aggregate initializers remain unlimited; dependencies
+  and format v1 are unchanged. README.md and FORMAT.md document accounting,
+  validation order, examples, and the need to combine this with a footer cap.
+- Release tests pass 11,383 checks (`make test`, `-O3 -DNDEBUG`). New tests cover
+  exact/one-below/zero caps, 1/7/64-column schemas, empty tables, many one-row
+  groups, short tails, mixed types, embedded NULs, and integer extremes. Source
+  roundtrips and independent scalar count/AND/wrapping-sum oracles verify that
+  accepted files retain query semantics. Independently built tiny malformed
+  footers advertise `UINT32_MAX` groups, verifying counts above 32 bits and
+  rejection before parsing an invalid schema name; an exact cap still reaches
+  normal structural validation.
+- Checks: initial `make sanitize` reached the documented LeakSanitizer fatal
+  error under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all
+  11,383 checks with address and undefined-behavior sanitizers active; leak
+  detection remains unverified here. `git diff --check` passed.
+- The fuzz harness now caps combined schema/chunk entries at 128 during Reader
+  construction. Initial `make fuzz` completed 1,000 inputs but hit the same
+  LeakSanitizer failure at exit. `ASAN_OPTIONS=detect_leaks=0 make fuzz` passed
+  1,000 runs with seed 42, Clang 18.1.3, max input 65,536 bytes, and five-second
+  per-input timeout, reusing the smoke-expanded corpus. This is bounded smoke
+  coverage, not a longer safety campaign or a process-memory guarantee.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-metadata-limit-2026-10-29`.
+  All five existing count workloads and three methods agreed with the row-store
+  baseline. All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-metadata-limit-2026-10-29.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-metadata-limit-2026-10-29-environment.txt).
+  The benchmark uses unlimited defaults and makes no performance claim;
+  earlier evidence remains unchanged.
+- Remaining: predicate-list/comparison work limits, exact allocation accounting
+  (including vector capacity, metadata strings, temporary copies, and retained
+  Readers/results), longer fuzz campaigns, and regression cases for findings.
+  This cap bounds metadata object counts and available chunks, not elapsed time
+  or exact memory; the footer is already loaded before the count check.
+  Streaming writes and bounded-memory reads remain the next larger feature;
+  checksums, expanded benchmarks, and profiled optimizations remain later items.

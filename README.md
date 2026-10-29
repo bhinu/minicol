@@ -61,7 +61,11 @@ rows per decoding pass in a read/scan/sum call. Shared predicate/sum chunks coun
 twice because they are decoded twice; pruning avoids charges. For example,
 `ReadLimits{1048576, 16777216, 65536, 16777216, 33554432, 1000000}` also
 limits each call to one million logical row visits. Defaults retain all format-v1
-dimensions. See
+dimensions. A seventh field, `max_metadata_entries`, caps schema fields plus
+chunk metadata entries before constructing those objects. For example,
+`ReadLimits{1048576, 16777216, 65536, 16777216, 33554432, 1000000, 10000}`
+also permits at most 10,000 combined schema/chunk entries. This is an object-count
+limit; pair it with the footer-byte cap to bound encoded metadata strings. See
 [resource limits and fuzzing](docs/FORMAT.md#resource-limits-and-fuzzing) for
 validation boundaries and memory limitations.
 

@@ -143,7 +143,7 @@ chunk in addition to the currently loaded predicate chunk.
 
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
 max_decoded_string_bytes, max_payload_bytes_per_operation,
-max_decoded_rows_per_operation})`
+max_decoded_rows_per_operation, max_metadata_entries})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -235,8 +235,33 @@ this accounting. Combine it with the byte, string, and group limits for
 untrusted inputs. Existing five-field initializers retain an unlimited row
 budget. Persisted format v1 is unchanged.
 
+`max_metadata_entries` is an inclusive construction-time cap on schema fields
+plus chunk metadata entries: `column_count * (group_count + 1)`. A schema field
+counts once, even for an empty table; each column in each group counts once.
+Group containers are not charged separately, but their count cannot exceed the
+chunk count because schemas are nonempty. Counts come from uint32 format fields;
+the calculation uses uint64 arithmetic and cannot overflow at their maxima.
+Zero rejects every file, including empty tables, because a schema is required.
+
+After loading the footer and validating its schema/group dimensions and group-row
+limit, construction checks this cap before parsing schema names or constructing
+schema/group/chunk objects. Exceeding it throws
+`std::runtime_error("metadata entry limit exceeded")`. This may precede errors
+in schema names or later metadata; satisfying the cap does not bypass any
+structural validation. All entries count even if later queries would prune their
+groups or never reference their columns. The cap is per Reader construction,
+does not charge queries, and does not change persisted format v1. Existing
+six-field initializers keep an unlimited metadata-entry cap.
+
+This bounds metadata object counts and the number of chunks available to query
+traversal, not exact allocations, string bytes, predicate-list work, or CPU time.
+The footer buffer has already been loaded; combine this cap with
+`max_footer_bytes` to constrain encoded metadata and copied names/zone strings.
+Vector capacity, object overhead, temporary copies, and caller-retained Readers
+still prevent an exact process-memory guarantee.
+
 Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, `UINT64_MAX`,
-and `UINT64_MAX`:
+`UINT64_MAX`, and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit
@@ -266,7 +291,8 @@ For a longer run after building:
 ```
 
 The harness caps input at 65,536 bytes, footer/chunk bytes at 4,096 each,
-actual group rows at 64, and decoded string bytes per chunk at 8,192. After
+actual group rows at 64, decoded string bytes per chunk at 8,192, and combined
+schema/chunk metadata entries at 128 before constructing those objects. After
 metadata validation it exercises payloads only
 for tables with at most 256 total rows and four columns. Expected parse/decode
 errors are rejected inputs; allocation failures and sanitizer errors remain

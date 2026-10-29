@@ -26,6 +26,8 @@ struct ReadLimits {
  uint64_t max_payload_bytes_per_operation=UINT64_MAX;
  // Cumulative chunk rows per decoding pass in each read/scan/sum operation.
  uint64_t max_decoded_rows_per_operation=UINT64_MAX;
+ // Schema fields plus chunk metadata entries, checked before object construction.
+ uint64_t max_metadata_entries=UINT64_MAX;
 };
 void write_file(const std::string& path, const std::vector<Field>& schema, const std::vector<Column>& columns, WriteOptions options={});
 class Reader {

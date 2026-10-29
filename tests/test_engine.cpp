@@ -667,6 +667,96 @@ void bounded_input_tests(const Scratch& scratch) {
         throws([&] { Reader r(path, {1024, 1024, 64}); }, "oversized footer dimension rejected");
     }
 }
+void metadata_entry_limit_tests(const Scratch& scratch) {
+    const auto path = scratch.file("metadata-limit.mc");
+    auto limits = [](uint64_t entries) {
+        ReadLimits cap;
+        cap.max_metadata_entries = entries;
+        return cap;
+    };
+    auto rejects_with = [&](uint64_t entries, const std::string& message) {
+        bool rejected = false;
+        try { Reader reader(path, limits(entries)); }
+        catch (const std::runtime_error& e) { rejected = e.what() == message; }
+        check(rejected, "metadata limit error: " + message);
+    };
+    for (size_t width : {size_t(1), size_t(7), size_t(64)}) {
+        for (size_t rows : {size_t(0), size_t(1), size_t(17)}) {
+            for (uint32_t group_size : {1u, 8u}) {
+                std::vector<Field> schema;
+                std::vector<Column> columns;
+                for (size_t c = 0; c < width; ++c) {
+                    schema.push_back({"column-" + std::to_string(c), c % 2 ? Type::String : Type::Int64});
+                    if (c % 2) {
+                        std::vector<std::string> values;
+                        for (size_t r = 0; r < rows; ++r)
+                            values.push_back(std::string("a\0", 2) + std::to_string(r % 3));
+                        columns.push_back(values);
+                    } else {
+                        std::vector<int64_t> values;
+                        for (size_t r = 0; r < rows; ++r)
+                            values.push_back(r % 2 ? INT64_MAX : -int64_t(r));
+                        columns.push_back(values);
+                    }
+                }
+                write_file(path, schema, columns, {group_size, 8});
+                const uint64_t groups = (rows + group_size - 1) / group_size;
+                const uint64_t entries = width + groups * width;
+                Reader exact(path, limits(entries));
+                check(exact.schema().size() == width && exact.groups().size() == groups,
+                      "exact metadata limit accepts schema and groups");
+                for (size_t g = 0; g < groups; ++g) {
+                    const auto begin = g * group_size, end = std::min(rows, begin + group_size);
+                    for (size_t c = 0; c < width; ++c) {
+                        const auto wanted = std::visit([&](const auto& values) -> Column {
+                            using Vec = std::decay_t<decltype(values)>;
+                            return Vec(values.begin() + begin, values.begin() + end);
+                        }, columns[c]);
+                        check(exact.read_column(g, c) == wanted, "metadata-limited source roundtrip");
+                    }
+                }
+                const std::vector<Predicate> filters{{0, Op::Between, int64_t(-8), int64_t(0)}};
+                scans(exact, columns, filters);
+                conjunctions(exact, columns, filters);
+                if (width > 1) {
+                    auto both = filters;
+                    both.push_back({1, Op::Equal, std::string("a\0", 2) + "0", std::string()});
+                    conjunctions(exact, columns, both);
+                }
+                check(uint64_t(exact.sum_int64(0).sum) == sum_oracle(columns, 0, {}),
+                      "metadata-limited unfiltered sum matches scalar oracle");
+                rejects_with(entries - 1, "metadata entry limit exceeded");
+                rejects_with(0, "metadata entry limit exceeded");
+                check(Reader(path).rows() == rows, "default metadata limit remains unlimited");
+                // Limits are per construction; a rejected Reader does not affect later opens.
+                check(Reader(path, limits(entries)).scan_all({}).matched == rows,
+                      "metadata limit exact reopen after rejection");
+            }
+        }
+    }
+    // Independently construct a tiny footer advertising billions of groups.
+    // Keep its dimensions plausible, but make the first schema name truncated:
+    // the entry cap must reject before parsing names or allocating group objects.
+    for (uint32_t width : {1u, 3u}) {
+        std::string bytes = "MINICOL1";
+        append_le(bytes, 1, 4);
+        append_le(bytes, 1, 4); // one row per group
+        std::string footer;
+        append_le(footer, UINT32_MAX, 8);
+        append_le(footer, width, 4);
+        append_le(footer, UINT32_MAX, 4);
+        append_le(footer, UINT32_MAX, 4); // impossible name length
+        footer.resize(16 + width * 5, '\0');
+        bytes += footer;
+        append_le(bytes, footer.size(), 8);
+        bytes += "MCOLEND1";
+        { std::ofstream out(path, std::ios::binary | std::ios::trunc);
+          out.write(bytes.data(), std::streamsize(bytes.size())); }
+        const uint64_t entries = uint64_t(width) * (uint64_t(UINT32_MAX) + 1);
+        rejects_with(entries - 1, "metadata entry limit exceeded");
+        rejects_with(entries, "truncated string");
+    }
+}
 void decoded_row_budget_tests(const Scratch& scratch) {
     const auto path = scratch.file("row-budget.mc");
     const int64_t lo = INT64_MIN, hi = INT64_MAX;
@@ -939,6 +1029,7 @@ int main() {
         conjunction_tests(scratch);
         aggregate_tests(scratch);
         bounded_input_tests(scratch);
+        metadata_entry_limit_tests(scratch);
         decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);
         invalid_tests(scratch);
