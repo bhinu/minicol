@@ -200,7 +200,7 @@ void structured_fuzz_tests(const Scratch& scratch) {
             }
         }
         const auto queries = structured_fuzz::queries(columns);
-        check(queries.size() <= 64, "structured query count stays bounded");
+        check(queries.size() <= 168, "structured query count stays bounded");
         bool empty = false, partial = false, full = false;
         for (const auto& filters : queries) {
             const auto count = conjunction_oracle(columns, filters);
@@ -211,8 +211,8 @@ void structured_fuzz_tests(const Scratch& scratch) {
             if (filters.size() == 1) scans(reader, columns, filters);
         }
         check(empty && partial && full, "structured queries exercise all selection outcomes");
-        // A single constant row must avoid reversed/contradictory bounds and
-        // retain valid query behavior for every source type.
+        // Single-row inputs retain valid query behavior for every source type,
+        // including empty selections from boundary probes.
         std::vector<Column> singleton;
         for (const auto& column : columns) singleton.push_back(std::visit([](const auto& values) -> Column {
             using Vec = std::decay_t<decltype(values)>;
@@ -225,6 +225,72 @@ void structured_fuzz_tests(const Scratch& scratch) {
     }
     check(seen[0][0] && seen[0][2] && seen[0][3] && seen[1][0] && seen[1][1] && seen[1][2],
           "structured seeds cover every codec/type combination");
+}
+void boundary_query_tests(const Scratch& scratch) {
+    check(structured_fuzz::boundary_probes(std::vector<int64_t>{}).empty(),
+          "empty integer column has no boundary probes");
+    check(structured_fuzz::boundary_probes(std::vector<std::string>{}).empty(),
+          "empty string column has no boundary probes");
+    const std::vector<int64_t> integers{INT64_MIN, INT64_MIN + 1, -10, -2, 0, 2, 10,
+                                        INT64_MAX - 1, INT64_MAX};
+    const std::vector<std::string> strings{"", std::string(1, '\0'), "a", "ab",
+        std::string("abc\0tail", 8), std::string("abc\0tail\0", 9),
+        std::string("abc\x7f", 4), std::string("abc\x80", 4), std::string(1, '\xff')};
+    const auto int_probes = structured_fuzz::boundary_probes(integers);
+    for (int64_t value : {INT64_MIN, INT64_MAX, INT64_MIN + 1, INT64_MAX - 1, int64_t(-1), int64_t(1)})
+        check(std::find(int_probes.begin(), int_probes.end(), Value(value)) != int_probes.end(),
+              "integer probes include signed edges and absent interior neighbors");
+    const auto string_probes = structured_fuzz::boundary_probes(strings);
+    for (const auto& value : std::vector<std::string>{"", std::string(1, '\0'),
+            std::string(1, '\x7f'), std::string(1, '\x80'), std::string(1, '\xff'),
+            std::string("abc\0", 4), std::string("abc\0tail\0", 9), std::string("\xff\0", 2)})
+        check(std::find(string_probes.begin(), string_probes.end(), Value(value)) != string_probes.end(),
+              "string probes include prefixes, NUL extensions, and high-bit bytes");
+
+    // Move every signed/string edge through the pivot position, including empty
+    // and NUL strings. Source values remain the oracle for every generated query.
+    for (size_t rotation = 0; rotation < integers.size(); ++rotation) {
+        auto ints = integers;
+        auto text = strings;
+        std::rotate(ints.begin(), ints.begin() + rotation, ints.end());
+        std::rotate(text.begin(), text.begin() + rotation, text.end());
+        const std::vector<Column> columns{ints, text,
+            std::vector<int64_t>(ints.size(), rotation % 2 ? INT64_MAX : INT64_MIN),
+            std::vector<std::string>(ints.size(), "")};
+        const auto path = scratch.file("boundary-queries.mc");
+        write_file(path, {{"i", Type::Int64}, {"s", Type::String},
+                         {"edge", Type::Int64}, {"empty", Type::String}}, columns, {4, 9});
+        Reader reader(path);
+        const auto queries = structured_fuzz::queries(columns);
+        check(queries.size() <= 168, "boundary queries fit the four-column fuzz bound");
+        bool absent_inside = false, absent_outside = false, reversed = false;
+        for (const auto& filters : queries) {
+            conjunctions(reader, columns, filters);
+            if (filters.size() != 1) continue;
+            scans(reader, columns, filters);
+            const auto& p = filters.front();
+            reversed |= p.op == Op::Between && p.high < p.low;
+            if (p.op != Op::Equal || oracle(columns[p.column], p)) continue;
+            const auto bounds = std::visit([](const auto& values) {
+                const auto b = std::minmax_element(values.begin(), values.end());
+                return std::make_pair(Value(*b.first), Value(*b.second));
+            }, columns[p.column]);
+            const bool outside = p.low < bounds.first || bounds.second < p.low;
+            absent_inside |= !outside;
+            absent_outside |= outside;
+            for (bool zones : {false, true}) {
+                const auto result = reader.scan(p, zones);
+                if (zones && outside)
+                    check(result.groups_read == 0 && result.bytes_read == reader.metadata_bytes(),
+                          "absent exterior equality prunes every payload");
+                if (!zones)
+                    check(result.groups_read == reader.groups().size(),
+                          "absent equality without zones validates every payload");
+            }
+        }
+        check(absent_inside && absent_outside && reversed,
+              "boundary generator retains absent interior/exterior and reversed queries");
+    }
 }
 void encoding_tests(const Scratch& scratch) {
     std::mt19937_64 rng(7331);
@@ -1682,6 +1748,7 @@ int main() {
     try {
         Scratch scratch;
         structured_fuzz_tests(scratch);
+        boundary_query_tests(scratch);
         encoding_tests(scratch);
         edge_tests(scratch);
         pruning_tests(scratch);

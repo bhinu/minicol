@@ -442,14 +442,22 @@ After metadata validation it exercises payloads only for tables with at most 256
 errors are rejected inputs; allocation failures and sanitizer errors remain
 failures. Accepted payloads are materialized and checked against independent
 row-wise scalar count/AND/sum oracles, including modulo-2^64 sums. A shared
-test-only generator supplies at most 64 query lists for the harness's four-column
+test-only generator supplies at most 168 query lists for the harness's four-column
 limit: first/middle/last equality, full and selective inclusive ranges, reversed
 ranges and contradictory equalities when bounds differ, duplicate predicates,
 mixed-column queries in both orders, all-column conjunctions, and the original
-incremental prefixes. Bounds come from decoded values rather than metadata;
-empty tables use only the empty conjunction. The release/sanitizer tests check
-the same generator against original source rows, including single-row tables,
-all codec/type combinations, and empty/partial/full selections. Unpruned scans
+incremental prefixes. Boundary probes add signed-domain extremes and guarded
+neighbors of integer minima, maxima, and pivots; strings add empty/NUL/high-bit
+values, pivot prefixes, and NUL extensions of pivots and maxima. Each of at most
+eight distinct probes per column becomes an equality and both inclusive range
+orientations around the pivot. Mixed-column queries combine a range surrounding
+the pivot with the next column's equality in both orders. This exercises absent
+values inside and outside zone bounds, prefix ordering, reversed ranges, and
+early termination. Bounds derive from decoded rows and deterministic probes
+rather than metadata; empty tables use only the empty conjunction. Release and
+sanitizer tests check the same generator against original source rows, including
+single-row tables, all codec/type combinations, signed-edge pivots, empty/NUL/high-bit strings,
+absent interior/exterior probes, and empty/partial/full selections. Unpruned scans
 are always checked. Pruned scans are checked only when decoded values fit every
 persisted zone bound: format v1 cannot detect arbitrary false bounds. The smoke
 is bounded coverage, not proof of malformed-input safety or a memory budget.

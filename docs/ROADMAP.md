@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, fuzz target, exhaustive packed-width fixtures, and structured mixed-column queries delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, fuzz target, exhaustive packed-width fixtures, structured mixed-column queries, and boundary probes beyond source values delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -598,3 +598,52 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   the production writer, with release tests comparing to original source rows.
   Streaming writes and bounded-memory readers remain the next larger feature;
   checksums, expanded benchmarks, and profiling remain later roadmap items.
+
+## Fuzz predicates beyond stored values — 2026-10-30
+
+- Extended the first roadmap item with deterministic boundary probes shared by
+  release tests and the fuzz harness. Integer probes include signed-domain
+  extremes and overflow-guarded neighbors of minima, maxima, and pivots. String
+  probes include empty/NUL/high-bit values, pivot prefixes, and NUL extensions
+  of pivots and maxima. Each probe supplies an equality and both inclusive range
+  orientations; additional mixed-column conjunctions run in both orders. All
+  previous source-value queries remain. The four-column harness now uses at most
+  168 query lists, with at most eight distinct probes per column. FORMAT.md
+  documents the expanded coverage; format v1, engine behavior, public API, and
+  dependencies are unchanged.
+- `make test` passed 251,007 checks in the release build (`-O3 -DNDEBUG`).
+  Independent source-row count/AND/wrapping-sum oracles cover every codec/type,
+  multiple groups and tails, singleton tables, reversed ranges, and predicate
+  reversal. Added sparse signed-edge and prefix/NUL/high-bit string fixtures,
+  rotating every value through the pivot, plus constant extreme integers and
+  empty strings. Verify absent equalities inside and outside source bounds,
+  metadata-only pruning of exterior probes, and unpruned payload visits.
+- Initial `make sanitize` reached the documented LeakSanitizer fatal error under
+  ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all 251,007 checks
+  with address and undefined-behavior sanitizers active; leak detection remains
+  unverified here. `git diff --check` passed.
+- Fuzz validation passed 10,000 inputs with no sanitizer or oracle failures.
+  Built with `make build/fuzz_reader build/fuzz_seeds` using Clang 18.1.3 with
+  libFuzzer/ASan/UBSan, then generated a fresh unchanged 88-file seed corpus:
+  `./build/fuzz_seeds build/fuzz-corpus-boundary-2026-10-30`.
+  Command:
+  `ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_reader build/fuzz-corpus-boundary-2026-10-30 -seed=42 -runs=10000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts-boundary-2026-10-30/ -print_final_stats=1`.
+  Full log remains in `build/fuzz-boundary-2026-10-30.log`; corpus and artifacts
+  remain local build outputs. This is bounded coverage, not proof of safety.
+- Required benchmark smoke passed:
+  `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-boundary-queries-2026-10-30`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  Retained all 15 trials in the [raw CSV](benchmark-smoke-boundary-queries-2026-10-30.csv),
+  with command, seed, row/trial counts, machine/compiler, flags, cache assumptions,
+  logical-byte accounting, and limitations in the
+  [environment record](benchmark-smoke-boundary-queries-2026-10-30-environment.txt).
+  This is a correctness smoke with unlimited defaults; no performance claim is
+  made, and earlier benchmark evidence remains unchanged.
+- Remaining: independently serialized multi-column/group fixtures, randomized
+  query bounds, longer fuzz campaigns and regressions for findings, exact
+  allocation accounting, and work budgets for dictionary construction, metadata
+  validation, selection intersection, and aggregation. Probe coverage is finite;
+  fuzz oracles still materialize accepted payloads and require trustworthy bounds
+  for pruned checks. Streaming writes and bounded-memory readers remain the next
+  larger feature; checksums, expanded benchmarks, and profiling remain later items.
