@@ -68,8 +68,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // reports, and oracle mismatches must escape or crash the fuzz iteration.
     std::vector<Column> columns;
     bool trustworthy_zones = true;
+    ReadLimits limits{4096, 4096, 64, 8192, UINT64_MAX, UINT64_MAX, 128};
+    // At most 128 metadata entries and 8192 logical string bytes per chunk:
+    // accepted inputs fit this cumulative cap, so oracle scans must succeed.
+    limits.max_decoded_string_bytes_per_operation = 1048576;
     try {
-        Reader reader(path, {4096, 4096, 64, 8192, UINT64_MAX, UINT64_MAX, 128});
+        Reader reader(path, limits);
         if (reader.rows() > 256 || reader.schema().size() > 4) return 0;
         for (size_t c = 0; c < reader.schema().size(); ++c) {
             Column all = reader.schema()[c].type == Type::Int64
@@ -92,7 +96,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     // Outside the rejection handler: successfully decoded chunks must scan and
     // aggregate consistently with this independent, materialized scalar oracle.
-    Reader reader(path, {4096, 4096, 64, 8192, UINT64_MAX, UINT64_MAX, 128});
+    Reader reader(path, limits);
     std::vector<Predicate> predicates;
     require(reader.scan_all({}).matched == reader.rows());
     if (reader.rows()) {

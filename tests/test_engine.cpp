@@ -333,8 +333,11 @@ void payload_corruption_tests(const Scratch& scratch) {
         in.close();
         mutate(bytes, meta);
         { std::ofstream out(path, std::ios::binary); out.write(bytes.data(), std::streamsize(bytes.size())); }
-        for (uint64_t cap : {UINT64_MAX, UINT64_MAX - 1}) {
-            Reader broken(path, {UINT64_MAX, UINT64_MAX, UINT32_MAX, cap});
+        for (unsigned budget_mode = 0; budget_mode < 3; ++budget_mode) {
+            ReadLimits limits;
+            if (budget_mode == 1) limits.max_decoded_string_bytes = UINT64_MAX - 1;
+            if (budget_mode == 2) limits.max_decoded_string_bytes_per_operation = UINT64_MAX - 1;
+            Reader broken(path, limits);
             throws([&] { broken.read_column(0, 0); }, "malformed codec rejected on materialization");
             Value low = type == Type::Int64 ? Value(int64_t(0)) : Value(std::string("value"));
             throws([&] { broken.scan({0, Op::Equal, low, low}, false); }, "malformed codec rejected on unpruned scan");
@@ -1301,6 +1304,106 @@ void decoded_row_budget_tests(const Scratch& scratch) {
     check(with_budget(0).scan_all({}).matched == 0 && with_budget(0).sum_int64(0).sum == 0,
           "empty table consumes no decoded rows");
 }
+void operation_string_budget_tests(const Scratch& scratch) {
+    const auto path = scratch.file("operation-string-budget.mc");
+    auto limited = [&](uint64_t bytes, uint64_t chunk_bytes = UINT64_MAX) {
+        ReadLimits limits;
+        limits.max_decoded_string_bytes = chunk_bytes;
+        limits.max_decoded_string_bytes_per_operation = bytes;
+        return Reader(path, limits);
+    };
+    auto rejects = [&](auto&& operation) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) {
+            rejected = std::string(e.what()) == "operation decoded string byte limit exceeded";
+        }
+        check(rejected, "operation string content budget rejects with documented error");
+    };
+    for (Encoding codec : {Encoding::Plain, Encoding::Dictionary, Encoding::RLE}) {
+        std::vector<std::string> text(2051);
+        std::vector<int64_t> groups(text.size()), values(text.size());
+        uint64_t total = 0, first = 0, largest = 0;
+        for (size_t i = 0; i < text.size(); ++i) {
+            groups[i] = int64_t(i / 1025);
+            values[i] = i % 3 ? INT64_MAX : INT64_MIN;
+            if (codec == Encoding::Plain) text[i] = "unique-" + std::to_string(i);
+            else if (codec == Encoding::Dictionary)
+                text[i] = std::string("label\0", 6) + std::string(20 + i % 3, char(0xff));
+            else text[i] = std::string(40, char('a' + i / 512));
+            total += text[i].size();
+            if (i < 1025) first += text[i].size();
+        }
+        const std::vector<Column> columns{groups, text, text, values};
+        write_file(path, {{"g", Type::Int64}, {"s", Type::String},
+                          {"t", Type::String}, {"v", Type::Int64}}, columns, {1025, 1025});
+        Reader source(path);
+        check(source.groups()[0][1].encoding == codec, "operation string fixture codec");
+        for (size_t g = 0; g < source.groups().size(); ++g) {
+            const size_t begin = g * 1025, end = std::min(begin + 1025, text.size());
+            uint64_t bytes = 0;
+            for (size_t i = begin; i < end; ++i) bytes += text[i].size();
+            largest = std::max(largest, bytes);
+            check(limited(bytes).read_column(g, 1) == Column(std::vector<std::string>(
+                      text.begin() + begin, text.begin() + end)), "operation exact chunk roundtrip");
+            rejects([&] { limited(bytes - 1).read_column(g, 1); });
+        }
+        const auto bounds = std::minmax_element(text.begin(), text.end());
+        const Predicate all{1, Op::Between, *bounds.first, *bounds.second};
+        Predicate other = all;
+        other.column = 2;
+        for (bool zones : {false, true}) {
+            Reader exact = limited(total, largest);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                check(exact.scan(all, zones).matched == oracle(columns[1], all),
+                      "cumulative string exact scan matches scalar oracle");
+                check(exact.scan_all({all, all}, zones).matched == conjunction_oracle(columns, {all, all}),
+                      "repeated predicates charge one string pass");
+                const auto sum = exact.sum_int64(3, {all}, zones);
+                check(sum.scan.matched == text.size() && uint64_t(sum.sum) == sum_oracle(columns, 3, {all}),
+                      "string-filtered wrapping sum matches scalar oracle");
+            }
+            Reader below = limited(total - 1, largest);
+            rejects([&] { below.scan(all, zones); });
+            rejects([&] { below.sum_int64(3, {all}, zones); });
+            check(below.scan_all({}).matched == text.size(), "operation budget resets after failure");
+            rejects([&] { limited(total * 2 - 1).scan_all({all, other}, zones); });
+            conjunctions(limited(total * 2, largest), columns, {all, other});
+            const Predicate first_group{0, Op::Equal, int64_t(0), int64_t(0)};
+            const std::vector<Predicate> partial{first_group, all};
+            check(limited(first).scan_all(partial, zones).matched == conjunction_oracle(columns, partial),
+                  "pruned groups and early empty selections avoid string charges");
+            const auto partial_sum = limited(first).sum_int64(3, partial, zones);
+            check(uint64_t(partial_sum.sum) == sum_oracle(columns, 3, partial),
+                  "partial sum content budget matches scalar oracle");
+            rejects([&] { limited(first - 1).scan_all(partial, zones); });
+            const Predicate missing{0, Op::Equal, int64_t(99), int64_t(0)};
+            check(limited(0).scan_all({missing, all}, zones).matched == 0,
+                  "zero content budget allows avoided string chunks");
+            rejects([&] { limited(0).scan(all, zones); });
+            // A selective encoded predicate still charges every logical string row.
+            const Predicate selective{1, Op::Equal, text[1], std::string()};
+            rejects([&] { limited(total - 1).scan(selective, false); });
+        }
+        check(limited(0).scan_all({}).matched == text.size(), "metadata count charges no string bytes");
+        check(uint64_t(limited(0).sum_int64(3).sum) == sum_oracle(columns, 3, {}),
+              "integer projection unaffected by zero string budget");
+        throws([&] { limited(0).scan_all({all, {99, Op::Equal, int64_t(0), int64_t(0)}}); },
+               "all predicate validation precedes operation string preflight");
+        bool chunk_first = false;
+        try { limited(0, 0).read_column(0, 1); }
+        catch (const std::runtime_error& e) {
+            chunk_first = std::string(e.what()) == "decoded string byte limit exceeded";
+        }
+        check(chunk_first, "chunk string limit checked before operation limit for each charge");
+    }
+    for (size_t rows : {size_t(0), size_t(2051)}) {
+        const std::vector<Column> columns{std::vector<int64_t>(rows, 7), std::vector<std::string>(rows)};
+        write_file(path, {{"i", Type::Int64}, {"s", Type::String}}, columns, {1025, 1025});
+        conjunctions(limited(0, 0), columns, {{1, Op::Equal, std::string(), std::string()}});
+        check(limited(0).scan_all({}).matched == rows, "zero content budget empty table/strings");
+    }
+}
 void decoded_string_budget_tests(const Scratch& scratch) {
     const auto path = scratch.file("string-budget.mc");
     for (Encoding codec : {Encoding::Plain, Encoding::Dictionary, Encoding::RLE}) {
@@ -1384,6 +1487,15 @@ void decoded_string_budget_tests(const Scratch& scratch) {
     Reader huge_below(path, {1024, 1024, UINT32_MAX, expanded - 1});
     throws([&] { huge_below.read_column(0, 0); }, "huge RLE rejected before materialization");
     throws([&] { huge_below.scan(all, false); }, "64-bit budget one below run expansion rejects");
+    ReadLimits operation_limit;
+    operation_limit.max_decoded_string_bytes_per_operation = expanded;
+    check(Reader(path, operation_limit).scan(all, false).matched == UINT32_MAX,
+          "64-bit exact operation string budget counts encoded RLE without expansion");
+    --operation_limit.max_decoded_string_bytes_per_operation;
+    throws([&] { Reader(path, operation_limit).scan(all, false); },
+           "64-bit operation string budget rejects below represented content");
+    throws([&] { Reader(path, operation_limit).read_column(0, 0); },
+           "operation budget rejects huge RLE before materialization");
     // Empty strings consume no decoded bytes; the budget resets for each call.
     for (uint32_t n : {1u, 2049u}) {
         write_file(path, {{"s", Type::String}}, {std::vector<std::string>(n)}, {1025, 1025});
@@ -1440,6 +1552,7 @@ int main() {
         metadata_entry_limit_tests(scratch);
         decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);
+        operation_string_budget_tests(scratch);
         invalid_tests(scratch);
         payload_corruption_tests(scratch);
         std::cout << "PASS: " << checks << " checks (encodings, scalar oracle, edge cases, pruning, malformed files)\n";

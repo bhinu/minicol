@@ -89,6 +89,14 @@ charges the common length only when lengths match. Charges happen before the
 comparison, even when strings differ early. This is logical byte-position
 accounting, not physical reads or a CPU-time guarantee. Defaults remain unlimited.
 
+`max_decoded_string_bytes_per_operation` adds an optional cumulative cap on
+logical string content across all loaded string chunks in each read/count/AND/sum
+call. For example, `limits.max_decoded_string_bytes_per_operation = 33554432;`
+permits 32 MiB per call. It counts every represented row, including repeated
+dictionary/RLE strings, even in encoded scans. Pruning avoids charges; duplicate
+predicates on one column share a charge. Combine it with the per-chunk
+`max_decoded_string_bytes` cap. Defaults remain unlimited.
+
 ## Evidence and boundaries
 
 An hourly GitHub-hosted development worker is active and its first generation, validation, and commit-push run passed. Linux/macOS correctness CI also passed. The previous local hourly automation is paused. See [cloud runner setup, controls, and evidence](docs/CLOUD_RUNNER.md).

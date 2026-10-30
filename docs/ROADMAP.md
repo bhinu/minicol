@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate-count/evaluation/string-comparison caps, metadata-entry caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -443,3 +443,61 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   and caller-retained data are outside the comparison budget. Streaming writes
   and bounded-memory reads remain the next larger feature; checksums, expanded
   benchmarks, and profiled optimizations remain later items.
+
+## Per-operation decoded-string content budgets — 2026-10-30
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_decoded_string_bytes_per_operation`, an inclusive cumulative
+  cap on row-expanded string content across loaded chunks in each read/count/
+  AND/sum call. This closes the gap between the existing per-chunk string cap
+  and scans spanning many groups or string predicate columns. Preflight checks
+  both caps before decoder string construction, using division/subtraction to
+  avoid overflow; excess throws without a partial result. Defaults and existing
+  ten-field initializers remain unlimited; dependencies and format v1 are unchanged.
+- Duplicate predicates on one column share a charge. Pruned chunks and columns
+  avoided by empty selections consume nothing. Every represented string row
+  counts, including dictionary references and RLE runs in encoded counts.
+  Integer projections consume nothing; each call resets its budget after success
+  or failure. README.md and FORMAT.md document scope, errors, validation order,
+  and limitations. This bounds logical content, not actual allocations, copying,
+  comparisons, CPU time, physical I/O, or caller-retained data.
+- `make test` passed 13,599 checks in the release build (`-O3 -DNDEBUG`). New
+  source-derived byte totals and independent scalar count/AND/wrapping-sum
+  oracles cover plain/dictionary/RLE strings, multiple groups and batch/group
+  tails, multiple predicate columns, NUL/high-bit bytes, exact/one-below/zero
+  caps, duplicate predicates, repeated calls, per-chunk cap interaction, partial/
+  full pruning, early termination, empty strings/tables, and integer-only calls.
+  An independently assembled tiny RLE file represents more than 4 GiB of string
+  content: exact 64-bit budgets permit encoded counts and one below rejects
+  before materialization. Malformed-payload tests now exercise unlimited,
+  finite per-chunk, and finite per-operation string-content preflight paths.
+- `make sanitize` encountered this environment's documented LeakSanitizer fatal
+  error under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all
+  13,599 checks with address and undefined-behavior sanitizers active; leak
+  detection remains unverified here. `git diff --check` passed.
+- The fuzz harness now exercises a finite 1 MiB cumulative decoded-string cap,
+  large enough for every accepted input under its existing chunk/metadata limits.
+  Built with `make build/fuzz_reader fuzz-seeds`; the initial 10,000-run campaign
+  completed its inputs but failed at exit on the documented LeakSanitizer ptrace
+  restriction. Rerun passed with
+  `ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_reader build/fuzz-corpus -seed=42 -runs=10000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts/`.
+  Used Clang 18.1.3, ASan/UBSan, seed 42, nine generated seeds plus the corpus
+  expanded by the first run, and a five-second per-input timeout. This is bounded
+  fuzz coverage, not a safety proof; leak detection remains unverified here.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-operation-string-budget-2026-10-30`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-operation-string-budget-2026-10-30.csv), with command,
+  seed, row/trial counts, machine/compiler, flags, cache assumptions, logical-byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-operation-string-budget-2026-10-30-environment.txt).
+  This smoke uses unlimited defaults and makes no performance claim; earlier
+  benchmark evidence remains unchanged.
+- Remaining: longer fuzz campaigns and regression cases for findings, exact
+  allocation accounting, and work budgets for dictionary construction, metadata
+  validation, selection intersection, and aggregation. Unused dictionary entries,
+  metadata strings, buffers, object overhead, and caller-retained data remain
+  outside this new cap. Streaming writes and bounded-memory reads remain the
+  next larger feature; checksums, expanded benchmarks, and profiling remain later
+  roadmap items.

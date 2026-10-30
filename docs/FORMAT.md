@@ -145,7 +145,8 @@ chunk in addition to the currently loaded predicate chunk.
 max_decoded_string_bytes, max_payload_bytes_per_operation,
 max_decoded_rows_per_operation, max_metadata_entries,
 max_predicates_per_operation, max_predicate_evaluations_per_operation,
-max_string_comparison_bytes_per_operation})`
+max_string_comparison_bytes_per_operation,
+max_decoded_string_bytes_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -177,6 +178,37 @@ this pass. This bounds logical string content, not process memory: encoded
 buffers, metadata strings, unused dictionary entries, vector capacity, temporary
 copies, and object overhead still need separate accounting. Total query work and
 memory retained by callers across reads remain unbounded.
+
+`max_decoded_string_bytes_per_operation` is an inclusive cumulative budget for
+logical string content across loaded chunks in one `read_column`, `scan`,
+`scan_all`, or `sum_int64` call. It uses the same row-expanded accounting as
+`max_decoded_string_bytes`: sum each row's string byte length, including NULs
+and repeated dictionary/RLE values, even when encoded scans avoid expansion.
+Each distinct loaded predicate column in each visited group contributes once;
+duplicate predicates on that column share the charge. Integer chunks, including
+sum projections, contribute nothing. Metadata-only counts, unfiltered sums,
+pruned chunks, and columns avoided by empty selections consume zero. Empty
+strings consume zero. A zero budget permits those operations.
+
+If either string-content cap is finite, preflight checks both after loading the
+encoded payload and before constructing decoder strings or materialized rows.
+For each string length/reference/run charge, check the per-chunk cap first,
+then the operation cap, with division/subtraction to avoid overflow. An excess
+of the operation cap throws
+`std::runtime_error("operation decoded string byte limit exceeded")`; earlier
+chunks may already have been decoded, but no partial result is returned. Row
+and payload-byte charges, predicate/projection validation, and zone-map checks
+retain their existing precedence. Malformed input may fail before exhaustion;
+exhaustion may prevent later payload validation. The budget resets per call,
+including after failure. Construction still validates metadata only.
+
+The default `UINT64_MAX` disables cumulative accounting; existing ten-field
+initializers remain unlimited. Format v1 is unchanged. This bounds logical
+row-expanded string content over loaded chunks, not actual allocations, string
+copies/comparisons, CPU time, or physical I/O. Unused dictionary entries, metadata
+strings, buffers, object overhead, and caller-retained results still need separate
+accounting. Predicate order and pruning can affect whether a call fits. Combine
+this cap with the existing per-chunk/input/work limits for untrusted queries.
 
 `max_payload_bytes_per_operation` is an inclusive cumulative budget for encoded
 chunk bytes loaded during one `read_column`, `scan`, `scan_all`, or `sum_int64`
@@ -392,9 +424,10 @@ For a longer run after building:
 
 The harness caps input at 65,536 bytes, footer/chunk bytes at 4,096 each,
 actual group rows at 64, decoded string bytes per chunk at 8,192, and combined
-schema/chunk metadata entries at 128 before constructing those objects. After
-metadata validation it exercises payloads only
-for tables with at most 256 total rows and four columns. Expected parse/decode
+schema/chunk metadata entries at 128 before constructing those objects. It also
+sets a 1 MiB per-operation decoded-string budget; accepted inputs fit that cap
+because there are at most 128 chunks of at most 8,192 logical string bytes each.
+After metadata validation it exercises payloads only for tables with at most 256 total rows and four columns. Expected parse/decode
 errors are rejected inputs; allocation failures and sanitizer errors remain
 failures. Accepted payloads are materialized and checked against independent
 row-wise scalar count/AND/sum oracles, including modulo-2^64 sums. Unpruned scans
