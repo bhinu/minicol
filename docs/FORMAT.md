@@ -144,7 +144,8 @@ chunk in addition to the currently loaded predicate chunk.
 `Reader(path, ReadLimits{max_footer_bytes, max_chunk_bytes, max_group_rows,
 max_decoded_string_bytes, max_payload_bytes_per_operation,
 max_decoded_rows_per_operation, max_metadata_entries,
-max_predicates_per_operation, max_predicate_evaluations_per_operation})`
+max_predicates_per_operation, max_predicate_evaluations_per_operation,
+max_string_comparison_bytes_per_operation})`
 accepts optional, inclusive limits. It rejects an oversized footer before loading
 its bytes, an oversized encoded chunk while parsing metadata (even if a later
 scan would prune it), and oversized actual row groups before constructing schema
@@ -315,8 +316,52 @@ metadata traversal, selection intersection, and aggregation need separate
 accounting. Combine this cap with the existing input and operation limits;
 a small evaluation budget alone does not bound payload allocation or expansion.
 
+`max_string_comparison_bytes_per_operation` is an inclusive cumulative budget
+for conservative string byte positions compared by one `scan`, `scan_all`, or
+`sum_int64` call. Each string ordering comparison charges `min(a.size(), b.size())`;
+equality charges that length when sizes match and zero otherwise. One byte
+position means a corresponding byte in each operand, not two physical bytes
+read. The entire charge occurs before invoking the standard string comparison,
+even if the first byte differs. This deliberately bounds potential comparison
+work without counting the library's actual byte reads. NUL and high-bit bytes
+count like other bytes, and existing `std::string` ordering is preserved.
+
+The budget includes both payload predicates and zone maps. Payload equality
+compares the value to the low bound; ranges compare `value < low`, then
+`high < value` only if needed. Zone equality compares `low < min`, then
+`max < low`; zone ranges compare `high < min`, `max < low`, then `high < low`.
+These zone comparisons stop at the first true result. Payload predicates stop
+at the first false result. Each comparison reached is charged separately,
+including repeated predicates and the two or three comparisons within a zone
+check. Dictionary entries (including unused entries) and RLE runs are checked
+once per predicate reached, while plain strings are checked per row. Skipped
+predicates, pruned payloads, and later columns avoided by empty selections cost
+nothing. Encoding, predicate order, and zone-map use can change the required
+budget without changing query results.
+
+Overflow-safe subtraction checks each charge against the remaining budget.
+An excess throws
+`std::runtime_error("operation string comparison byte limit exceeded")` without
+a partial result. The budget resets per call, including after failures. Predicate
+count and all predicate/projection validation precede comparisons; each
+predicate's evaluation budget is charged before its string comparisons. Payload
+comparisons follow loading, applicable decoding budgets, and decoder setup.
+Earlier payloads may already have been read/decoded; budget exhaustion may
+prevent later structural validation. Construction-time metadata validation,
+writer comparisons, `read_column`, empty conjunction counts, unfiltered sums,
+and integer comparisons consume none of this budget. Empty strings and
+unequal-length payload equalities can therefore succeed with zero. Zone maps
+still perform ordering comparisons even for equality predicates.
+
+The default `UINT64_MAX` disables this accounting, and existing nine-field
+initializers remain unlimited. Format v1 is unchanged. This is a conservative
+logical work cap, not a measurement of actual comparison bytes, physical memory
+reads, CPU instructions, elapsed time, or allocations. It does not cover string
+copying/decoding, dictionary construction, metadata validation, selection
+intersection, or aggregation; combine it with the existing limits.
+
 Defaults are `UINT64_MAX`, `UINT64_MAX`, `UINT32_MAX`, `UINT64_MAX`, `UINT64_MAX`,
-`UINT64_MAX`, `UINT64_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
+`UINT64_MAX`, `UINT64_MAX`, `UINT64_MAX`, `UINT64_MAX`, and `UINT64_MAX`:
 existing callers retain all format-v1 dimensions, subject to file-bound checks, address space, stream
 limits, and available resources. No small input or process-memory budget is
 imposed by default. Callers handling untrusted files should choose explicit

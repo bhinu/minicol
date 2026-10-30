@@ -916,6 +916,162 @@ void predicate_evaluation_budget_tests(const Scratch& scratch) {
     write_file(path, {{"v", Type::Int64}}, {std::vector<int64_t>{}});
     conjunctions(limited(0), {std::vector<int64_t>{}}, {{0, Op::Equal, int64_t(1), int64_t(0)}});
 }
+void string_comparison_budget_tests(const Scratch& scratch) {
+    const auto path = scratch.file("comparison-bytes.mc");
+    auto limited = [&](uint64_t budget) {
+        ReadLimits limits;
+        limits.max_string_comparison_bytes_per_operation = budget;
+        return Reader(path, limits);
+    };
+    auto rejects_with = [&](const std::function<void()>& operation, const std::string& error) {
+        bool caught = false;
+        try { operation(); }
+        catch (const std::runtime_error& e) { caught = e.what() == error; }
+        check(caught, "comparison byte budget error: " + error);
+    };
+    const std::string exhausted = "operation string comparison byte limit exceeded";
+    const size_t n = 2053, group_size = 1025;
+    std::vector<int64_t> ints(n);
+    std::vector<std::string> plain(n), dict(n), runs(n);
+    const std::string prefix = std::string(80, 'p') + std::string("\0\xff", 2);
+    for (size_t i = 0; i < n; ++i) {
+        ints[i] = i % 2 ? INT64_MAX : 1;
+        plain[i] = prefix + std::to_string(i);
+        dict[i] = prefix + std::string(i % 3 + 1, char('a' + i % 3));
+        runs[i] = prefix + std::string(i / 256 % 3 + 1, char('a' + i / 256 % 3));
+    }
+    const std::vector<Column> columns{ints, plain, dict, runs};
+    write_file(path, {{"ints", Type::Int64}, {"plain", Type::String},
+                      {"dict", Type::String}, {"runs", Type::String}}, columns,
+               {group_size, group_size});
+    const Reader source(path);
+    const std::vector<Encoding> codecs{Encoding::BitPacked, Encoding::Plain,
+                                      Encoding::Dictionary, Encoding::RLE};
+    // Model comparison charges using source strings and standard comparisons,
+    // independently of payload decoding and the engine's comparison helpers.
+    auto cost = [&](size_t column, const std::vector<Predicate>& query, bool zones) {
+        uint64_t bytes = 0;
+        auto lt = [&](const std::string& a, const std::string& b) {
+            bytes += std::min(a.size(), b.size());
+            return a < b;
+        };
+        const auto& values = std::get<std::vector<std::string>>(columns[column]);
+        for (size_t begin = 0, g = 0; begin < n; begin += group_size, ++g) {
+            const auto end = std::min(n, begin + group_size);
+            const auto bounds = std::minmax_element(values.begin() + begin, values.begin() + end);
+            bool skip = false;
+            if (zones) for (const auto& p : query) {
+                const auto& lo = std::get<std::string>(p.low);
+                if (p.op == Op::Equal) skip = lt(lo, *bounds.first) || lt(*bounds.second, lo);
+                else {
+                    const auto& hi = std::get<std::string>(p.high);
+                    skip = lt(hi, *bounds.first) || lt(*bounds.second, lo) || lt(hi, lo);
+                }
+                if (skip) break;
+            }
+            if (skip) continue;
+            std::vector<std::string> units;
+            const auto codec = source.groups()[g][column].encoding;
+            for (size_t i = begin; i < end; ++i) {
+                if (codec == Encoding::Dictionary &&
+                    std::find(units.begin(), units.end(), values[i]) != units.end()) continue;
+                if (codec == Encoding::RLE && i > begin && values[i] == values[i - 1]) continue;
+                units.push_back(values[i]);
+            }
+            for (const auto& s : units) for (const auto& p : query) {
+                const auto& lo = std::get<std::string>(p.low);
+                bool hit;
+                if (p.op == Op::Equal) {
+                    if (s.size() == lo.size()) bytes += s.size();
+                    hit = s == lo;
+                } else hit = !lt(s, lo) && !lt(std::get<std::string>(p.high), s);
+                if (!hit) break;
+            }
+        }
+        return bytes;
+    };
+    std::vector<Predicate> all;
+    for (size_t c = 1; c < columns.size(); ++c) {
+        check(source.groups()[0][c].encoding == codecs[c], "comparison fixture codec");
+        const auto& values = std::get<std::vector<std::string>>(columns[c]);
+        const auto bounds = std::minmax_element(values.begin(), values.end());
+        all.push_back({c, Op::Between, *bounds.first, *bounds.second});
+        const Predicate equal{c, Op::Equal, values[0], int64_t(0)};
+        const Predicate absent{c, Op::Equal, std::string(values[0].size(), 'z'), int64_t(0)};
+        const Predicate shorter{c, Op::Equal, std::string(), int64_t(0)};
+        const Predicate reversed{c, Op::Between, *bounds.second, *bounds.first};
+        const Predicate below{c, Op::Between, std::string("a"), std::string("b")};
+        const Predicate above{c, Op::Between, std::string("z"), std::string("zz")};
+        for (const auto& query : std::vector<std::vector<Predicate>>{
+                 {all.back()}, {equal}, {equal, all.back()}, {all.back(), equal},
+                 {equal, equal}, {absent, all.back()}, {shorter}, {reversed}, {below}, {above}}) {
+            for (bool zones : {false, true}) {
+                const auto budget = cost(c, query, zones);
+                const auto exact = limited(budget);
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    const auto result = exact.scan_all(query, zones);
+                    check(result.matched == conjunction_oracle(columns, query), "comparison count scalar oracle");
+                    const auto sum = exact.sum_int64(0, query, zones);
+                    check(sum.scan.matched == result.matched && uint64_t(sum.sum) == sum_oracle(columns, 0, query),
+                          "comparison wrapping sum scalar oracle");
+                }
+                if (query.size() == 1)
+                    check(exact.scan(query[0], zones).matched == oracle(columns[c], query[0]),
+                          "single comparison scan scalar oracle");
+                if (budget) {
+                    const auto below_limit = limited(budget - 1);
+                    rejects_with([&] { below_limit.scan_all(query, zones); }, exhausted);
+                    rejects_with([&] { below_limit.sum_int64(0, query, zones); }, exhausted);
+                    check(below_limit.scan_all({}).matched == n, "budget resets after rejection");
+                    check(below_limit.scan_all({shorter}, false).matched == 0, "no retained exhausted state");
+                }
+            }
+        }
+    }
+    for (bool zones : {false, true}) for (bool reverse : {false, true}) {
+        auto query = all;
+        if (reverse) std::reverse(query.begin(), query.end());
+        uint64_t budget = 0;
+        for (const auto& p : query) budget += cost(p.column, {p}, zones);
+        const auto exact = limited(budget);
+        check(exact.scan_all(query, zones).matched == conjunction_oracle(columns, query),
+              "multi-column comparison budget scalar oracle");
+        check(uint64_t(exact.sum_int64(0, query, zones).sum) == sum_oracle(columns, 0, query),
+              "multi-column comparison sum scalar oracle");
+        rejects_with([&] { limited(budget - 1).scan_all(query, zones); }, exhausted);
+    }
+    const auto zero = limited(0);
+    conjunctions(zero, columns, {});
+    conjunctions(zero, columns, {{0, Op::Equal, int64_t(1), int64_t(0)}});
+    // An empty earlier column selection bypasses later string payloads.
+    check(zero.scan_all({{0, Op::Equal, int64_t(0), int64_t(0)}, all[0]}, false).matched == 0,
+          "empty selection avoids string comparisons");
+    check(zero.read_column(0, 1) == Column(std::vector<std::string>(plain.begin(), plain.begin() + group_size)),
+          "materialization consumes no comparison budget");
+    rejects_with([&] { zero.scan(all[0]); }, exhausted);
+    rejects_with([&] { zero.scan({1, Op::Equal, int64_t(0), int64_t(0)}); }, "predicate type mismatch");
+    rejects_with([&] { zero.scan_all({all[0], {1, Op(99), std::string(), std::string()}}); },
+                 "invalid predicate operation");
+    rejects_with([&] { zero.sum_int64(1, {all[0]}); }, "sum requires integer column");
+    // Existing aggregate initializers leave the appended field unlimited.
+    ReadLimits old{UINT64_MAX, UINT64_MAX, UINT32_MAX, UINT64_MAX, UINT64_MAX,
+                   UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    conjunctions(Reader(path, old), columns, all);
+    // Sufficient finite limits still expose malformed payloads.
+    { std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+      file.seekp(std::streamoff(source.groups()[0][1].offset));
+      for (int i = 0; i < 4; ++i) file.put(char(255)); }
+    rejects_with([&] { limited(cost(1, {all[0]}, false)).scan(all[0], false); }, "truncated string");
+    // Empty strings need no byte positions, including equality and zone checks.
+    write_file(path, {{"i", Type::Int64}, {"s", Type::String}},
+               {std::vector<int64_t>{1, 2}, std::vector<std::string>{"", ""}});
+    conjunctions(limited(0), {std::vector<int64_t>{1, 2}, std::vector<std::string>{"", ""}},
+                 {{1, Op::Equal, std::string(), int64_t(0)}});
+    write_file(path, {{"i", Type::Int64}, {"s", Type::String}},
+               {std::vector<int64_t>{}, std::vector<std::string>{}});
+    conjunctions(limited(0), {std::vector<int64_t>{}, std::vector<std::string>{}},
+                 {{1, Op::Between, prefix, prefix}});
+}
 void metadata_entry_limit_tests(const Scratch& scratch) {
     const auto path = scratch.file("metadata-limit.mc");
     auto limits = [](uint64_t entries) {
@@ -1280,6 +1436,7 @@ int main() {
         bounded_input_tests(scratch);
         predicate_limit_tests(scratch);
         predicate_evaluation_budget_tests(scratch);
+        string_comparison_budget_tests(scratch);
         metadata_entry_limit_tests(scratch);
         decoded_row_budget_tests(scratch);
         decoded_string_budget_tests(scratch);

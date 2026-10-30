@@ -1,0 +1,31 @@
+rows=10000 row_store_bytes=1520000 column_store_bytes=1070772 metadata_bytes=484 seed=42
+plain_chunks=1
+dictionary_chunks=1
+rle_chunks=1
+bitpacked_chunks=2
+
+String-comparison-byte-budget regression smoke recorded 2026-10-30 (UTC).
+Build: make build/benchmark
+Compiler: c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+Flags: -Iinclude -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic
+Machine: Linux x86_64, kernel 7.0.0-1017-azure, Microsoft virtual machine;
+AMD EPYC 7763 64-Core Processor, 4 exposed logical CPUs, 2 threads/core.
+Command:
+./build/benchmark 10000 1 build/data-smoke-comparison-budget-2026-10-30 > docs/benchmark-smoke-comparison-budget-2026-10-30.csv 2> docs/benchmark-smoke-comparison-budget-2026-10-30-environment.txt
+Rows: 10000; data seed: 42 (std::mt19937_64); trials: 1 per query/method.
+Row group size: default 65536, one partial group. Writer sample size: 2048.
+Five existing count workloads, three methods; all 15 raw CSV trials retained.
+Every result agreed with the independent fixed-width row-store scan.
+Cache assumptions: freshly written files, one untimed warmup per method/query,
+no OS cache eviction; results likely benefit from the filesystem cache.
+All timed scans reopen files; column timings include Reader metadata parsing.
+Method order rotates by trial; this smoke uses trial zero's row_store,
+column_no_zones, column_zones order. No statistical inference.
+bytes_read counts logical file bytes requested, not physical disk reads or cache
+misses. Column bytes include header/footer/trailer once plus loaded encoded
+predicate chunks. Row bytes count complete 152-byte records. File sizes above
+are logical file sizes, excluding filesystem/block/cache overhead.
+Limitations: correctness/regression smoke only; small synthetic input, one group,
+one trial, shared virtual hardware, no AND or projected-sum performance coverage.
+The benchmark uses unlimited ReadLimits; configured comparison-budget overhead
+is not measured. No new performance claim; earlier evidence remains unchanged.

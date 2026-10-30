@@ -1,0 +1,16 @@
+query,mode,trial,rows,matched,elapsed_ms,rows_per_second,bytes_read,groups_read,groups_skipped,batches
+sorted_key_range,row_store,0,10000,100,0.150503,66443858.261962,1520000,0,0,10
+sorted_key_range,column_no_zones,0,10000,100,0.128722,77686797.905564,17993,1,0,10
+sorted_key_range,column_zones,0,10000,100,0.126127,79285164.952786,17993,1,0,10
+small_integer_equality,row_store,0,10000,11,0.097904,102140872.691616,1520000,0,0,10
+small_integer_equality,column_no_zones,0,10000,11,0.134634,74275443.053018,12993,1,0,10
+small_integer_equality,column_zones,0,10000,11,0.108313,92325021.003942,12993,1,0,10
+repetitive_integer_equality,row_store,0,10000,0,0.093676,106750928.733080,1520000,0,0,10
+repetitive_integer_equality,column_no_zones,0,10000,0,0.015729,635768326.021998,520,1,0,10
+repetitive_integer_equality,column_zones,0,10000,0,0.012223,818129755.379203,484,0,1,0
+dictionary_equality,row_store,0,10000,580,0.225153,44414242.759368,1520000,0,0,10
+dictionary_equality,column_no_zones,0,10000,580,0.035106,284851592.320401,40718,1,0,10
+dictionary_equality,column_zones,0,10000,580,0.032602,306729648.487823,40718,1,0,10
+absent_dictionary_value,row_store,0,10000,0,0.247134,40463877.896202,1520000,0,0,10
+absent_dictionary_value,column_no_zones,0,10000,0,0.037872,264047317.279256,40718,1,0,10
+absent_dictionary_value,column_zones,0,10000,0,0.012494,800384184.408516,484,0,1,0

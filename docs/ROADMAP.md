@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate-count/evaluation caps, metadata-entry caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/predicate-count/evaluation/string-comparison caps, metadata-entry caps, and fuzz target delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -397,3 +397,49 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   metadata traversal, selection intersection, and aggregation still need separate
   work accounting. Streaming writes and bounded-memory reads remain the next
   larger feature; checksums, expanded benchmarks, and profiling remain later items.
+
+## Per-operation string-comparison byte budgets — 2026-10-30
+
+- Extended the first roadmap item with opt-in
+  `ReadLimits::max_string_comparison_bytes_per_operation`, a cumulative budget
+  for conservative logical string byte positions in predicate and zone-map
+  comparisons. Charge the shorter operand length before ordering comparisons;
+  equality charges the common length only when lengths match. Charge the full
+  bound even for early mismatches, using subtraction to avoid overflow. An
+  excess throws without a partial result. Defaults and existing nine-field
+  initializers stay unlimited; format v1 and dependencies are unchanged.
+- Shared accounting covers plain rows, dictionary entries, RLE runs, repeated
+  predicates, columns, and groups. Short-circuited comparisons consume nothing;
+  integer comparisons, materialization, unfiltered sums, and construction-time
+  metadata validation are unaffected. README.md and FORMAT.md document exact
+  comparison order, error precedence, per-call resets, zero-budget behavior,
+  and limitations. This bounds logical potential comparison work, not physical
+  reads, actual library byte comparisons, CPU time, or allocations.
+- `make test` passed 13,285 checks in the release build (`-O3 -DNDEBUG`). New
+  source-based budget calculations and independent scalar count/AND/wrapping-sum
+  oracles cover all three string codecs, multiple groups and batch/group tails,
+  long shared prefixes, NUL/high-bit bytes, variable lengths, exact/one-below/zero
+  budgets, repeated calls/predicates, reversed ranges and predicate order,
+  short-circuiting, full/partial pruning, multi-column accumulation, empty
+  strings/tables, malformed payloads, validation precedence, and compatibility
+  with previous aggregate initializers.
+- Initial `make sanitize` reached this environment's documented LeakSanitizer
+  fatal error under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed
+  all 13,285 checks with address and undefined-behavior sanitizers active; leak
+  detection remains unverified here. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-comparison-budget-2026-10-30`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  All 15 trials are retained in the
+  [raw CSV](benchmark-smoke-comparison-budget-2026-10-30.csv), with command, seed,
+  row/trial counts, machine/compiler, flags, cache assumptions, logical-byte
+  accounting, and limitations in the
+  [environment record](benchmark-smoke-comparison-budget-2026-10-30-environment.txt).
+  This smoke uses unlimited defaults and makes no performance claim; earlier
+  benchmark evidence remains unchanged.
+- Remaining: longer fuzz campaigns and regression cases for findings, exact
+  allocation accounting, and work limits for dictionary construction, metadata
+  validation, selection intersection, and aggregation. String copying/decoding
+  and caller-retained data are outside the comparison budget. Streaming writes
+  and bounded-memory reads remain the next larger feature; checksums, expanded
+  benchmarks, and profiled optimizations remain later items.

@@ -81,6 +81,14 @@ Dictionary entries and RLE runs count once per predicate actually evaluated;
 plain/packed values count per row. Short-circuited predicates consume nothing.
 This bounds evaluation count, not string comparison bytes or elapsed time.
 
+A tenth field, `max_string_comparison_bytes_per_operation`, caps a conservative
+string-comparison byte budget across predicate and zone-map checks. Set it by
+name, for example `limits.max_string_comparison_bytes_per_operation = 1048576;`.
+Each ordering comparison charges the shorter operand's byte length; equality
+charges the common length only when lengths match. Charges happen before the
+comparison, even when strings differ early. This is logical byte-position
+accounting, not physical reads or a CPU-time guarantee. Defaults remain unlimited.
+
 ## Evidence and boundaries
 
 An hourly GitHub-hosted development worker is active and its first generation, validation, and commit-push run passed. Linux/macOS correctness CI also passed. The previous local hourly automation is paused. See [cloud runner setup, controls, and evidence](docs/CLOUD_RUNNER.md).
