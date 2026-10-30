@@ -1,5 +1,6 @@
 #include "minicol/engine.hpp"
 #include "packed_fixture.hpp"
+#include "structured_fuzz.hpp"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -163,6 +164,67 @@ void roundtrip(const std::string& path, const std::vector<Field>& schema,
     conjunctions(reader, columns, {});
     for (size_t count = 1; count <= predicates.size(); ++count)
         conjunctions(reader, columns, {predicates.begin(), predicates.begin() + count});
+}
+void structured_fuzz_tests(const Scratch& scratch) {
+    check(structured_fuzz::queries({}).size() == 1, "no-column query generation");
+    check(structured_fuzz::queries({std::vector<int64_t>{}}).size() == 1,
+          "empty-table query generation");
+    const auto source = structured_fuzz::columns();
+    bool seen[2][4] = {};
+    for (uint32_t group_rows : {17u, 64u}) for (size_t first = 0; first < source.size(); ++first) {
+        std::vector<Field> schema;
+        std::vector<Column> columns;
+        for (size_t j = 0; j < 4; ++j) {
+            const auto& column = source[(first + j) % source.size()];
+            schema.push_back({"c" + std::to_string(j), column.index() == 0 ? Type::Int64 : Type::String});
+            columns.push_back(column);
+        }
+        const auto path = scratch.file("structured.mc");
+        write_file(path, schema, columns, {group_rows, 64});
+        ReadLimits limits{4096, 4096, 64, 8192, UINT64_MAX, UINT64_MAX, 128};
+        limits.max_decoded_string_bytes_per_operation = 1048576;
+        Reader reader(path, limits);
+        check(fs::file_size(path) <= 65536 && reader.rows() <= 256,
+              "structured seeds fit fuzz input/row limits");
+        check(reader.groups().back().front().rows == 129 % group_rows,
+              "structured seeds include short group tails");
+        for (size_t g = 0; g < reader.groups().size(); ++g) {
+            for (size_t c = 0; c < columns.size(); ++c) {
+                const auto& meta = reader.groups()[g][c];
+                seen[columns[c].index()][size_t(meta.encoding)] = true;
+                const auto decoded = reader.read_column(g, c);
+                for (size_t row = 0; row < meta.rows; ++row)
+                    check(structured_fuzz::at(decoded, row) ==
+                          structured_fuzz::at(columns[c], g * group_rows + row),
+                          "structured seed roundtrip agrees with source");
+            }
+        }
+        const auto queries = structured_fuzz::queries(columns);
+        check(queries.size() <= 64, "structured query count stays bounded");
+        bool empty = false, partial = false, full = false;
+        for (const auto& filters : queries) {
+            const auto count = conjunction_oracle(columns, filters);
+            empty |= count == 0;
+            partial |= count > 0 && count < reader.rows();
+            full |= count == reader.rows();
+            conjunctions(reader, columns, filters);
+            if (filters.size() == 1) scans(reader, columns, filters);
+        }
+        check(empty && partial && full, "structured queries exercise all selection outcomes");
+        // A single constant row must avoid reversed/contradictory bounds and
+        // retain valid query behavior for every source type.
+        std::vector<Column> singleton;
+        for (const auto& column : columns) singleton.push_back(std::visit([](const auto& values) -> Column {
+            using Vec = std::decay_t<decltype(values)>;
+            return Vec{values.front()};
+        }, column));
+        write_file(path, schema, singleton, {1, 1});
+        Reader one(path, limits);
+        for (const auto& filters : structured_fuzz::queries(singleton))
+            conjunctions(one, singleton, filters);
+    }
+    check(seen[0][0] && seen[0][2] && seen[0][3] && seen[1][0] && seen[1][1] && seen[1][2],
+          "structured seeds cover every codec/type combination");
 }
 void encoding_tests(const Scratch& scratch) {
     std::mt19937_64 rng(7331);
@@ -1619,6 +1681,7 @@ void invalid_tests(const Scratch& scratch) {
 int main() {
     try {
         Scratch scratch;
+        structured_fuzz_tests(scratch);
         encoding_tests(scratch);
         edge_tests(scratch);
         pruning_tests(scratch);

@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, fuzz target, and exhaustive packed-width fixtures delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, fuzz target, exhaustive packed-width fixtures, and structured mixed-column queries delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -545,4 +545,56 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   any findings, exact allocation accounting, and work budgets for dictionary
   construction, metadata validation, selection intersection, and aggregation.
   Streaming writes and bounded-memory reads remain the next larger feature;
+  checksums, expanded benchmarks, and profiling remain later roadmap items.
+
+## Structured multi-column fuzz queries — 2026-10-30
+
+- Extended the first roadmap item with 14 generated mixed-codec seeds, rotating
+  four-column windows across all codec fixtures in 17- and 64-row groups with
+  short tails. The generated corpus now contains 88 files; binary inputs remain
+  local build outputs. A shared test-only query generator adds first/middle/last
+  equalities, selective ranges, reversed ranges, contradictions, duplicates,
+  mixed-column queries in both orders, and all-column conjunctions while retaining
+  the previous incremental prefixes. Each accepted fuzz input uses at most 64
+  query lists under the existing four-column cap. Single-predicate lists also
+  check `scan`, alongside AND counts and all integer projections.
+- `make test` passed 170,798 checks in the release build (`-O3 -DNDEBUG`).
+  Source-data roundtrips and independent scalar count/AND/wrapping-sum oracles
+  exercise the shared generator over all codec/type combinations, split runs,
+  signed extremes, embedded NULs, short group tails, single-row tables, duplicate
+  predicates, predicate reversal, empty/partial/full selections, and exact scan
+  counters. Tests verify that structured seeds fit the fuzz harness limits.
+  Dependencies, public API, and persisted format v1 are unchanged. FORMAT.md
+  documents the expanded seeds and query coverage.
+- Fuzz validation: built with `make build/fuzz_reader build/fuzz_seeds` using
+  Clang 18.1.3/libFuzzer/ASan/UBSan. The initial fresh 88-seed, 10,000-input run
+  completed its inputs but failed at exit on the documented LeakSanitizer ptrace
+  restriction. A second fresh 88-seed campaign passed with:
+  `./build/fuzz_seeds build/fuzz-corpus-structured-recheck`, then
+  `ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_reader build/fuzz-corpus-structured-recheck -seed=42 -runs=10000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts/ -print_final_stats=1`.
+  Both runs used seed 42, a 65,536-byte input cap, and five-second per-input
+  timeout; logs remain in `build/fuzz-structured-2026-10-30.log` and
+  `build/fuzz-structured-recheck-2026-10-30.log`. No sanitizer or oracle failure
+  occurred with leak detection disabled; leaks remain unverified. This is
+  bounded coverage, not proof of malformed-input safety or exact memory bounds.
+- Sanitizers: initial `make sanitize` reached the documented LeakSanitizer fatal
+  error under ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all
+  170,798 checks with address and undefined-behavior checks active. Leak detection
+  remains unverified in this environment. `git diff --check` passed.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-structured-fuzz-2026-10-30`.
+  All five count workloads and three methods agreed with the row-store baseline.
+  Retained all 15 trials in the [raw CSV](benchmark-smoke-structured-fuzz-2026-10-30.csv),
+  with command, seed, row/trial counts, machine/compiler, flags, cache assumptions,
+  logical-byte accounting, and limitations in the
+  [environment record](benchmark-smoke-structured-fuzz-2026-10-30-environment.txt).
+  This is a correctness smoke with unlimited defaults; no performance claim is
+  made, and earlier benchmark evidence remains unchanged.
+- Remaining: broader independently serialized multi-column/group fixtures,
+  predicates not drawn from source values, longer fuzz campaigns and regressions
+  for any findings, exact allocation accounting, and work budgets for dictionary
+  construction, metadata validation, selection intersection, and aggregation.
+  Fuzz count/sum oracles materialize accepted payloads; new structured seeds use
+  the production writer, with release tests comparing to original source rows.
+  Streaming writes and bounded-memory readers remain the next larger feature;
   checksums, expanded benchmarks, and profiling remain later roadmap items.

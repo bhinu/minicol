@@ -1,5 +1,6 @@
 #include "minicol/engine.hpp"
 #include "packed_fixture.hpp"
+#include "structured_fuzz.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -15,24 +16,27 @@ namespace fs = std::filesystem;
 int main(int argc, char** argv) {
     if (argc != 2) return 1;
     fs::create_directories(argv[1]);
-    std::vector<int64_t> plain(129), packed(129), runs(129), constant(129, -7);
-    std::vector<std::string> text(129), dict(129), text_runs(129);
-    for (size_t i = 0; i < plain.size(); ++i) {
-        plain[i] = i % 2 ? INT64_MAX : INT64_MIN;
-        packed[i] = int64_t(i % 31) - 15;
-        runs[i] = (i / 32) % 2 ? INT64_MAX : INT64_MIN;
-        text[i] = "unique-" + std::to_string(i) + std::string("\0tail", 5);
-        dict[i] = "long-dictionary-label-" + std::to_string(i % 3);
-        text_runs[i] = std::string(40, char('a' + i / 32));
-    }
-    const std::vector<Column> columns{plain, packed, runs, constant, text, dict, text_runs};
+    const auto columns = structured_fuzz::columns();
     for (size_t c = 0; c < columns.size(); ++c)
         write_file((fs::path(argv[1]) / ("codec-" + std::to_string(c))).string(),
                    {{"v", c < 4 ? Type::Int64 : Type::String}}, {columns[c]}, {64, 64});
     write_file((fs::path(argv[1]) / "mixed").string(),
-               {{"i", Type::Int64}, {"s", Type::String}}, {packed, dict}, {64, 64});
+               {{"i", Type::Int64}, {"s", Type::String}}, {columns[1], columns[5]}, {64, 64});
     write_file((fs::path(argv[1]) / "empty").string(),
                {{"v", Type::Int64}}, {std::vector<int64_t>{}});
+    // Rotate four-column windows so every codec leads mixed-column queries.
+    // 17-row groups split runs and leave a ten-row tail; 64 leaves one row.
+    for (uint32_t group_rows : {17u, 64u}) for (size_t first = 0; first < columns.size(); ++first) {
+        std::vector<Field> schema;
+        std::vector<Column> mixed;
+        for (size_t j = 0; j < 4; ++j) {
+            const auto& column = columns[(first + j) % columns.size()];
+            schema.push_back({"c" + std::to_string(j), column.index() == 0 ? Type::Int64 : Type::String});
+            mixed.push_back(column);
+        }
+        write_file((fs::path(argv[1]) / ("structured-" + std::to_string(group_rows) + "-" +
+                   std::to_string(first))).string(), schema, mixed, {group_rows, 64});
+    }
     // Explicit widths bypass adaptive writer fallback (especially width 64).
     // Nine rows include byte-crossing tails while fitting the harness limits.
     for (unsigned width = 0; width <= 64; ++width) {
@@ -107,21 +111,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // Outside the rejection handler: successfully decoded chunks must scan and
     // aggregate consistently with this independent, materialized scalar oracle.
     Reader reader(path, limits);
-    std::vector<Predicate> predicates;
     require(reader.scan_all({}).matched == reader.rows());
-    if (reader.rows()) {
-        for (size_t c = 0; c < columns.size(); ++c) {
-            const auto pivot = at(columns[c], size_t(reader.rows() / 2));
-            predicates.push_back({c, Op::Equal, pivot, pivot});
-            const auto bounds = std::visit([](const auto& v) {
-                const auto b = std::minmax_element(v.begin(), v.end());
-                return std::make_pair(Value(*b.first), Value(*b.second));
-            }, columns[c]);
-            predicates.push_back({c, Op::Between, bounds.first, bounds.second});
-        }
-    }
-    for (size_t n = 0; n <= predicates.size(); ++n) {
-        const std::vector<Predicate> filters(predicates.begin(), predicates.begin() + n);
+    for (const auto& filters : structured_fuzz::queries(columns)) {
         uint64_t count = 0;
         std::vector<uint64_t> sums(columns.size(), 0);
         for (size_t row = 0; row < reader.rows(); ++row) {
@@ -136,6 +127,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         for (bool zones : {false, true}) {
             if (zones && !trustworthy_zones) continue;
             require(reader.scan_all(filters, zones).matched == count);
+            if (filters.size() == 1) require(reader.scan(filters.front(), zones).matched == count);
             for (size_t c = 0; c < columns.size(); ++c) {
                 if (columns[c].index() != 0) continue;
                 const auto result = reader.sum_int64(c, filters, zones);

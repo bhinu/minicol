@@ -411,7 +411,7 @@ The reader still validates payloads only when loaded and assumes immutable files
 
 `make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the
 engine and regular tests still need only dependency-free C++17. `FUZZ_CXX` can
-select a compatible compiler. The target generates 74 seed files in
+select a compatible compiler. The target generates 88 seed files in
 `build/fuzz-corpus` covering every codec/type combination, zero-width packing,
 empty tables, multiple columns, group tails, NUL strings, and signed extremes.
 These include 65 independently serialized packed chunks, one for each width
@@ -422,6 +422,9 @@ with independent scalar query oracles, signed-edge bases, and row counts around
 the 1,024-value batch boundary. Every truncated payload prefix of the nine-row
 fixtures (with intact metadata), trailing payload bytes, and all invalid width
 tags are checked too.
+Fourteen additional structured seeds rotate four-column windows over the codec
+fixtures, using 17- and 64-row groups with short tails. This puts every codec at
+the front of mixed-column queries and splits runs across group boundaries.
 `make fuzz` runs 1,000 inputs with seed 42 and a five-second per-input timeout. Corpus
 and failure artifacts stay under `build/`; no binary corpus is checked in.
 For a longer run after building:
@@ -438,7 +441,15 @@ because there are at most 128 chunks of at most 8,192 logical string bytes each.
 After metadata validation it exercises payloads only for tables with at most 256 total rows and four columns. Expected parse/decode
 errors are rejected inputs; allocation failures and sanitizer errors remain
 failures. Accepted payloads are materialized and checked against independent
-row-wise scalar count/AND/sum oracles, including modulo-2^64 sums. Unpruned scans
+row-wise scalar count/AND/sum oracles, including modulo-2^64 sums. A shared
+test-only generator supplies at most 64 query lists for the harness's four-column
+limit: first/middle/last equality, full and selective inclusive ranges, reversed
+ranges and contradictory equalities when bounds differ, duplicate predicates,
+mixed-column queries in both orders, all-column conjunctions, and the original
+incremental prefixes. Bounds come from decoded values rather than metadata;
+empty tables use only the empty conjunction. The release/sanitizer tests check
+the same generator against original source rows, including single-row tables,
+all codec/type combinations, and empty/partial/full selections. Unpruned scans
 are always checked. Pruned scans are checked only when decoded values fit every
 persisted zone bound: format v1 cannot detect arbitrary false bounds. The smoke
 is bounded coverage, not proof of malformed-input safety or a memory budget.
