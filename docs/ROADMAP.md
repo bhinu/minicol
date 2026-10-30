@@ -10,7 +10,7 @@
 
 ## Next useful improvements, in order
 
-1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, and fuzz target delivered below).
+1. Extend the bounded malformed-input/fuzz coverage with longer campaigns and total-work/memory budgets (input, decoded-string, per-operation payload/decoded-row/decoded-string/predicate-count/evaluation/string-comparison caps, metadata-entry caps, fuzz target, and exhaustive packed-width fixtures delivered below).
 2. Add streaming row-group writes and bounded-memory readers for large inputs.
 3. Add file/chunk checksums with a format version bump and compatibility tests.
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
@@ -501,3 +501,48 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   outside this new cap. Streaming writes and bounded-memory reads remain the
   next larger feature; checksums, expanded benchmarks, and profiling remain later
   roadmap items.
+
+## Packed-width decoder coverage and longer fuzz campaign — 2026-10-30
+
+- Extended the first roadmap item with test-only, independently serialized
+  format-v1 packed fixtures for all widths 0–64. The bit-by-bit serializer
+  bypasses adaptive writer selection, including the legal width-64 encoding
+  that the writer replaces with plain storage. Shared fixtures also generate
+  65 additional fuzz seeds, bringing the generated corpus to 74 files. Engine
+  behavior, public API, persisted format v1, and dependencies are unchanged.
+- Release `make test` passed 124,729 checks (`-O3 -DNDEBUG`). New source-value
+  comparisons and independent scalar count/AND/wrapping-sum oracles cover
+  widths 0–64, signed-edge bases, alternating/full/single-bit delta patterns,
+  and 1/9/1023/1024/1025-row chunks. Check exact finite payload/group/row caps,
+  repeated predicates, shared projections, empty/reversed selections, zone
+  pruning, and byte/batch counters. Every truncated payload prefix of each
+  nine-row width fixture retains an intact footer and is rejected on loading;
+  trailing payload bytes and all width tags 65–255 are rejected too.
+- Initial `make sanitize` hit the documented LeakSanitizer fatal error under
+  ptrace. `ASAN_OPTIONS=detect_leaks=0 make sanitize` passed all 124,729 checks
+  with address and undefined-behavior sanitizers active; leak detection remains
+  unverified in this environment. `git diff --check` passed.
+- Longer fuzz run passed 100,000 inputs with no sanitizer or oracle failures:
+  `make build/fuzz_reader fuzz-seeds`, then
+  `ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_reader build/fuzz-corpus -seed=42 -runs=100000 -max_len=65536 -timeout=5 -artifact_prefix=build/fuzz-artifacts/ -print_final_stats=1`.
+  Used Clang 18.1.3 with libFuzzer/ASan/UBSan and a fresh 74-file generated
+  corpus, seed 42, a 65,536-byte input cap, and a five-second per-input timeout.
+  Corpus, artifacts, and full log (`build/fuzz-packed-widths-2026-10-30.log`)
+  remain local build outputs; source generators preserve the regression inputs.
+  Leak detection was disabled for the documented ptrace restriction. This is
+  bounded coverage, not proof of malformed-input safety.
+- Required benchmark smoke: `make build/benchmark`, then
+  `./build/benchmark 10000 1 build/data-smoke-packed-widths-2026-10-30`.
+  All five existing count workloads and three methods agreed with the row-store
+  baseline. Retained all 15 trials in the [raw CSV](benchmark-smoke-packed-widths-2026-10-30.csv),
+  with command, seed, row/trial counts, machine/compiler, flags, cache assumptions,
+  logical-byte accounting, concurrent sanitizer activity, and limitations in the
+  [environment record](benchmark-smoke-packed-widths-2026-10-30-environment.txt).
+  This is a correctness smoke; no performance claim is made and earlier evidence
+  remains unchanged.
+- Remaining: broader structured fuzz inputs (especially multi-column/group
+  combinations and predicate variations), longer campaigns and regressions for
+  any findings, exact allocation accounting, and work budgets for dictionary
+  construction, metadata validation, selection intersection, and aggregation.
+  Streaming writes and bounded-memory reads remain the next larger feature;
+  checksums, expanded benchmarks, and profiling remain later roadmap items.

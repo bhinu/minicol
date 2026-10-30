@@ -1,4 +1,5 @@
 #include "minicol/engine.hpp"
+#include "packed_fixture.hpp"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -458,6 +459,84 @@ std::string dimension_fixture(uint32_t rows, Encoding encoding, const std::strin
     append_le(bytes, footer.size(), 8);
     bytes += "MCOLEND1";
     return bytes;
+}
+void packed_width_tests(const Scratch& scratch) {
+    const auto path = scratch.file("packed-widths.mc");
+    auto save = [&](const packed_fixture::Fixture& fixture) {
+        const auto bytes = fixture.file();
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) throw std::runtime_error("packed fixture write failed");
+    };
+    for (unsigned width = 0; width <= 64; ++width) {
+        const uint64_t mask = width == 0 ? 0 : UINT64_MAX >> (64 - width);
+        std::vector<int64_t> bases{INT64_MIN};
+        if (width < 64) {
+            bases.push_back(-int64_t(mask / 2));
+            bases.push_back(INT64_MAX - int64_t(mask));
+        }
+        for (const auto base : bases) for (uint32_t rows : {1u, 9u, 1023u, 1024u, 1025u}) {
+            const auto fixture = packed_fixture::make(width, rows, base);
+            save(fixture);
+            // Exact finite limits must accept even width 64, which the writer
+            // never chooses because plain storage is smaller.
+            ReadLimits limits;
+            limits.max_chunk_bytes = fixture.payload.size();
+            limits.max_group_rows = rows;
+            limits.max_payload_bytes_per_operation = fixture.payload.size();
+            limits.max_decoded_rows_per_operation = uint64_t(rows) * 2;
+            Reader reader(path, limits);
+            const std::vector<Column> columns{fixture.values};
+            check(reader.read_column(0, 0) == columns[0], "every packed width decodes source values");
+            const auto bounds = std::minmax_element(fixture.values.begin(), fixture.values.end());
+            const Predicate all{0, Op::Between, *bounds.first, *bounds.second};
+            const Predicate equal{0, Op::Equal, fixture.values[rows / 2], int64_t(0)};
+            const Predicate negative{0, Op::Between, int64_t(INT64_MIN), int64_t(-1)};
+            const Predicate reversed{0, Op::Between, int64_t(1), int64_t(-1)};
+            scans(reader, columns, {all, equal, negative, reversed});
+            for (const auto& filters : std::vector<std::vector<Predicate>>{
+                     {}, {equal}, {all, negative}, {all, equal, equal}, {reversed}})
+                conjunctions(reader, columns, filters);
+            const auto sum = reader.sum_int64(0, {all});
+            check(sum.scan.bytes_read == reader.metadata_bytes() + fixture.payload.size() &&
+                  sum.scan.batches == (uint64_t(rows) + 1023) / 1024,
+                  "packed shared projection retains single-read byte and batch accounting");
+        }
+
+        // Every truncated payload prefix retains a valid footer. Include the
+        // zero-width header, partial final bytes, and an extra trailing byte.
+        const auto valid = packed_fixture::make(width, 9, INT64_MIN);
+        auto rejects = [&](const packed_fixture::Fixture& broken) {
+            save(broken);
+            Reader reader(path);
+            const Predicate all{0, Op::Between, int64_t(INT64_MIN), int64_t(INT64_MAX)};
+            throws([&] { reader.read_column(0, 0); }, "truncated/oversized packed materialization rejected");
+            throws([&] { reader.scan(all, false); }, "truncated/oversized packed count rejected");
+            throws([&] { reader.scan_all({all, all}, false); }, "malformed packed AND rejected");
+            throws([&] { reader.sum_int64(0); }, "malformed packed projection rejected");
+            throws([&] { reader.sum_int64(0, {all}, false); }, "malformed shared packed projection rejected");
+            const Predicate absent{0, Op::Between, int64_t(1), int64_t(-1)};
+            check(reader.scan(absent).matched == 0 && reader.sum_int64(0, {absent}).sum == 0,
+                  "zone pruning avoids malformed packed payload");
+        };
+        for (size_t size = 0; size < valid.payload.size(); ++size) {
+            auto broken = valid;
+            broken.payload.resize(size);
+            rejects(broken);
+        }
+        auto trailing = valid;
+        trailing.payload += char(0);
+        rejects(trailing);
+    }
+    // All out-of-range width tags, including those with their high bit set.
+    for (unsigned width = 65; width <= 255; ++width) {
+        auto broken = packed_fixture::make(0, 1, 0);
+        broken.payload[8] = char(width);
+        save(broken);
+        Reader reader(path);
+        throws([&] { reader.read_column(0, 0); }, "reject every invalid packed width");
+        throws([&] { reader.sum_int64(0); }, "reject invalid packed width in sum");
+    }
 }
 void bounded_input_tests(const Scratch& scratch) {
     const auto path = scratch.file("bounded.mc");
@@ -1545,6 +1624,7 @@ int main() {
         pruning_tests(scratch);
         conjunction_tests(scratch);
         aggregate_tests(scratch);
+        packed_width_tests(scratch);
         bounded_input_tests(scratch);
         predicate_limit_tests(scratch);
         predicate_evaluation_budget_tests(scratch);

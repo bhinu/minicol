@@ -411,10 +411,18 @@ The reader still validates payloads only when loaded and assumes immutable files
 
 `make fuzz` optionally requires Clang's libFuzzer, ASan, and UBSan runtimes; the
 engine and regular tests still need only dependency-free C++17. `FUZZ_CXX` can
-select a compatible compiler. The target generates nine seed files in
+select a compatible compiler. The target generates 74 seed files in
 `build/fuzz-corpus` covering every codec/type combination, zero-width packing,
 empty tables, multiple columns, group tails, NUL strings, and signed extremes.
-It runs 1,000 inputs with seed 42 and a five-second per-input timeout. Corpus
+These include 65 independently serialized packed chunks, one for each width
+from 0 through 64, with nine rows to exercise byte-crossing tails. Width 64 is
+legal to read even though the adaptive writer chooses plain storage instead.
+The regular release/sanitizer suite uses the same test-only bit-by-bit serializer
+with independent scalar query oracles, signed-edge bases, and row counts around
+the 1,024-value batch boundary. Every truncated payload prefix of the nine-row
+fixtures (with intact metadata), trailing payload bytes, and all invalid width
+tags are checked too.
+`make fuzz` runs 1,000 inputs with seed 42 and a five-second per-input timeout. Corpus
 and failure artifacts stay under `build/`; no binary corpus is checked in.
 For a longer run after building:
 

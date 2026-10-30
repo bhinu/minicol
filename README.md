@@ -23,7 +23,7 @@ python3 bench/summarize.py docs/benchmark-raw.csv
 - Zone maps skip groups whose ranges cannot satisfy equality or inclusive range predicates. AND scans intersect row selections across predicate columns and stop reading a group when no rows remain.
 - Projected int64 sums over AND selections, with defined two's-complement wraparound and per-scan byte/group counters.
 - Batches of up to 1,024 values, dictionary predicates evaluated through integer IDs, and RLE predicates evaluated once per run. Scalar C++ batch execution; no explicit SIMD intrinsics.
-- Reader validation, full-column roundtrip decoding, scan counters, independent scalar-oracle correctness tests, ASan/UBSan, and a Linux/macOS CI workflow template.
+- Reader validation, full-column roundtrip decoding, scan counters, independent scalar-oracle correctness tests (including all 65 packed widths), ASan/UBSan, and a Linux/macOS CI workflow template.
 - Deterministic benchmark against a fixed-width binary row store with identical rows and query results.
 
 ## API example

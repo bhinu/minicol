@@ -1,4 +1,5 @@
 #include "minicol/engine.hpp"
+#include "packed_fixture.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -32,6 +33,15 @@ int main(int argc, char** argv) {
                {{"i", Type::Int64}, {"s", Type::String}}, {packed, dict}, {64, 64});
     write_file((fs::path(argv[1]) / "empty").string(),
                {{"v", Type::Int64}}, {std::vector<int64_t>{}});
+    // Explicit widths bypass adaptive writer fallback (especially width 64).
+    // Nine rows include byte-crossing tails while fitting the harness limits.
+    for (unsigned width = 0; width <= 64; ++width) {
+        const auto bytes = packed_fixture::make(width, 9, INT64_MIN).file();
+        std::ofstream out(fs::path(argv[1]) / ("packed-width-" + std::to_string(width)),
+                          std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) throw std::runtime_error("packed seed write failed");
+    }
 }
 #else
 namespace {
