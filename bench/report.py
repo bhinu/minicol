@@ -68,12 +68,12 @@ Use the facts below to update my projects section for storage/database/systems r
 
 - C++17 columnar engine from scratch, with versioned binary files, 65,536-row groups, contiguous column chunks, schema/offset/encoding footer, and per-group min/max zone maps.
 - Adaptive dictionary encoding for strings, integer/string RLE, signed integer frame-of-reference bit packing, and plain fallback; sampled candidate selection plus full-size fallback.
-- Up to 1,024-value scan batches, single-column equality/range count predicates, dictionary-ID filtering without per-row string materialization, direct run filtering.
-- 1,659 correctness checks covering scalar oracle agreement, all codecs, randomized roundtrips, int64 extremes, malformed files, and pruning; passing AddressSanitizer and UndefinedBehaviorSanitizer locally. Linux/macOS CI workflow supplied as a template; not active because the GitHub login lacks workflow permission.
+- Up to 1,024-value scan batches, single-column and AND count filters with selection vectors, projected int64 sums, dictionary-ID filtering without per-row string materialization, and direct run filtering.
+- 251,007 correctness checks (not separate test cases), covering independent scalar oracles, all 65 packed widths, randomized roundtrips, int64 extremes, malformed files, and pruning. AddressSanitizer and UndefinedBehaviorSanitizer pass locally. Linux/macOS correctness CI is installed. Optional input/work limits and libFuzzer coverage are implemented. The API-funded development worker is disabled as of November 2.
 
 ## Measured evidence
 
-One million synthetic rows; seven repetitions per method; optimized Apple clang 21, Darwin arm64, warm cache. Median elapsed times and comparisons to a naive fixed-width binary row store:
+Historical measurements from the October 27 engine revision, before subsequent AND/sum and input-hardening work. One million synthetic rows; seven repetitions per method; optimized Apple clang 21, Darwin arm64, warm cache. Median elapsed times and comparisons to a naive fixed-width binary row store:
 
 - Sorted-key range: {ms('sorted_key_range','row_store'):.3f} ms row store, {ms('sorted_key_range','column_no_zones'):.3f} ms column scan without pruning, {ms('sorted_key_range','column_zones'):.3f} ms with pruning. Skipped 15/16 row groups; 93.15% fewer requested column bytes (2,004,223 to 137,280).
 - Low-cardinality string equality: {ms('dictionary_equality','row_store'):.3f} ms row store versus {ms('dictionary_equality','column_zones'):.3f} ms column engine ({speed('dictionary_equality'):.1f}x). No groups skipped; benefits include projection and dictionary-ID evaluation.
@@ -85,7 +85,7 @@ These are narrow synthetic comparisons. Bytes are logical file bytes requested, 
 
 - Built a C++17 columnar storage engine with adaptive dictionary/RLE/bit-packed encodings, binary row groups, and metadata-driven zone-map pruning.
 - Implemented 1,024-value scan batches and encoded string predicates; skipped 15 of 16 row groups and reduced requested column bytes by 93% on a one-million-row sorted-range benchmark.
-- Validated all codecs and scans with 1,659 correctness checks, scalar-oracle comparisons, and address/undefined-behavior sanitizers; benchmarked five workloads against a binary row-store baseline.
+- Added AND filtering and projected integer sums, with independent scalar-oracle checks, malformed-input tests, fuzz coverage, and address/undefined-behavior sanitizers.
 
 Full methodology: docs/BENCHMARKS.md. Raw data: docs/benchmark-raw.csv. Format and tradeoffs: docs/FORMAT.md.
 '''

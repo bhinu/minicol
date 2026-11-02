@@ -7,235 +7,760 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace minicol { namespace {
-using Bytes=std::vector<uint8_t>;
-[[noreturn]] void bad(const char* s) { throw std::runtime_error(s); }
-void put(Bytes& b,uint64_t v,unsigned n) { for(unsigned i=0;i<n;++i)b.push_back(uint8_t(v>>(i*8))); }
-void str(Bytes& b,const std::string& s) { if(s.size()>UINT32_MAX)bad("string too long");put(b,s.size(),4);b.insert(b.end(),s.begin(),s.end()); }
-int64_t signed_bits(uint64_t v) { int64_t x;std::memcpy(&x,&v,8);return x; }
+namespace minicol {
+namespace {
+using Bytes = std::vector<uint8_t>;
+[[noreturn]] void bad(const char *s) {
+    throw std::runtime_error(s);
+}
+void put(Bytes &b, uint64_t v, unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+        b.push_back(uint8_t(v >> (i * 8)));
+}
+void str(Bytes &b, const std::string &s) {
+    if (s.size() > UINT32_MAX)
+        bad("string too long");
+    put(b, s.size(), 4);
+    b.insert(b.end(), s.begin(), s.end());
+}
+int64_t signed_bits(uint64_t v) {
+    int64_t x;
+    std::memcpy(&x, &v, 8);
+    return x;
+}
+// Keep bounds checks beside every read, before advancing through untrusted bytes.
 struct Cursor {
- const Bytes& b;size_t p=0;
- uint64_t get(unsigned n) { if(n>b.size()-p)bad("truncated data");uint64_t v=0;for(unsigned i=0;i<n;++i)v|=uint64_t(b[p++])<<(8*i);return v; }
- std::string string() { auto n=get(4);if(n>b.size()-p)bad("truncated string");std::string s(reinterpret_cast<const char*>(b.data()+p),size_t(n));p+=size_t(n);return s; }
- void done() { if(p!=b.size())bad("unexpected trailing bytes"); }
+    const Bytes &b;
+    size_t p = 0;
+    uint64_t get(unsigned n) {
+        if (n > b.size() - p)
+            bad("truncated data");
+        uint64_t v = 0;
+        for (unsigned i = 0; i < n; ++i)
+            v |= uint64_t(b[p++]) << (8 * i);
+        return v;
+    }
+    std::string string() {
+        auto n = get(4);
+        if (n > b.size() - p)
+            bad("truncated string");
+        std::string s(reinterpret_cast<const char *>(b.data() + p), size_t(n));
+        p += size_t(n);
+        return s;
+    }
+    void done() {
+        if (p != b.size())
+            bad("unexpected trailing bytes");
+    }
 };
-void value(Bytes& b,const Value& v) { if(auto p=std::get_if<int64_t>(&v))put(b,uint64_t(*p),8);else str(b,std::get<std::string>(v)); }
-Value value(Cursor& c,Type t) { if(t==Type::Int64)return signed_bits(c.get(8));return c.string(); }
-bool less(const Value& a,const Value& b) { return a.index()==0?std::get<int64_t>(a)<std::get<int64_t>(b):std::get<std::string>(a)<std::get<std::string>(b); }
+void value(Bytes &b, const Value &v) {
+    if (auto p = std::get_if<int64_t>(&v))
+        put(b, uint64_t(*p), 8);
+    else
+        str(b, std::get<std::string>(v));
+}
+Value value(Cursor &c, Type t) {
+    if (t == Type::Int64)
+        return signed_bits(c.get(8));
+    return c.string();
+}
+bool less(const Value &a, const Value &b) {
+    return a.index() == 0 ? std::get<int64_t>(a) < std::get<int64_t>(b)
+                          : std::get<std::string>(a) < std::get<std::string>(b);
+}
 // Charge a conservative byte-position bound before invoking string comparisons.
 // UINT64_MAX retains the default comparison path without cumulative accounting.
-void charge_comparison(const Value& a,const Value& b,uint64_t& remaining,bool equality=false) {
- if(remaining==UINT64_MAX||a.index()==0)return;
- const auto& x=std::get<std::string>(a);const auto& y=std::get<std::string>(b);
- if(equality&&x.size()!=y.size())return;
- const auto n=std::min(x.size(),y.size());
- if(n>remaining)bad("operation string comparison byte limit exceeded");
- remaining-=n;
+void charge_comparison(const Value &a, const Value &b, uint64_t &remaining, bool equality = false) {
+    if (remaining == UINT64_MAX || a.index() == 0)
+        return;
+    const auto &x = std::get<std::string>(a);
+    const auto &y = std::get<std::string>(b);
+    if (equality && x.size() != y.size())
+        return;
+    const auto n = std::min(x.size(), y.size());
+    if (n > remaining)
+        bad("operation string comparison byte limit exceeded");
+    remaining -= n;
 }
-bool query_less(const Value& a,const Value& b,uint64_t& remaining) {
- charge_comparison(a,b,remaining);return less(a,b);
+bool query_less(const Value &a, const Value &b, uint64_t &remaining) {
+    charge_comparison(a, b, remaining);
+    return less(a, b);
 }
-bool matches(const Value& v,const Predicate& p,uint64_t& remaining) {
- if(p.op==Op::Equal){charge_comparison(v,p.low,remaining,true);return v==p.low;}
- return !query_less(v,p.low,remaining)&&!query_less(p.high,v,remaining);
+bool matches(const Value &v, const Predicate &p, uint64_t &remaining) {
+    if (p.op == Op::Equal) {
+        charge_comparison(v, p.low, remaining, true);
+        return v == p.low;
+    }
+    return !query_less(v, p.low, remaining) && !query_less(p.high, v, remaining);
 }
-Bytes load(std::ifstream& in,uint64_t off,uint64_t n) { if(n>SIZE_MAX||n>uint64_t(std::numeric_limits<std::streamsize>::max()))bad("chunk too large");Bytes b(static_cast<size_t>(n));in.clear();in.seekg(static_cast<std::streamoff>(off));if(!in||!in.read(reinterpret_cast<char*>(b.data()),static_cast<std::streamsize>(n)))bad("file read failed");return b; }
+Bytes load(std::ifstream &in, uint64_t off, uint64_t n) {
+    if (n > SIZE_MAX || n > uint64_t(std::numeric_limits<std::streamsize>::max()))
+        bad("chunk too large");
+    Bytes b(static_cast<size_t>(n));
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(off));
+    if (!in || !in.read(reinterpret_cast<char *>(b.data()), static_cast<std::streamsize>(n)))
+        bad("file read failed");
+    return b;
+}
 // Subtract before loading: cumulative payload accounting cannot overflow.
-Bytes load_payload(std::ifstream& in,const ChunkMeta& m,uint64_t& remaining) {
- if(m.bytes>remaining)bad("operation payload byte limit exceeded");
- remaining-=m.bytes;
- return load(in,m.offset,m.bytes);
+Bytes load_payload(std::ifstream &in, const ChunkMeta &m, uint64_t &remaining) {
+    if (m.bytes > remaining)
+        bad("operation payload byte limit exceeded");
+    remaining -= m.bytes;
+    return load(in, m.offset, m.bytes);
 }
-void charge_rows(const ChunkMeta& m,uint64_t& remaining) {
- if(m.rows>remaining)bad("operation decoded row limit exceeded");
- remaining-=m.rows;
+void charge_rows(const ChunkMeta &m, uint64_t &remaining) {
+    if (m.rows > remaining)
+        bad("operation decoded row limit exceeded");
+    remaining -= m.rows;
 }
 // Preflight finite string budgets without constructing strings or expanding runs.
 // Charge every row, even when encoded predicates would avoid materialization.
-void check_string_budget(const Bytes& b,Type type,const ChunkMeta& m,uint64_t budget,uint64_t& operation_budget) {
- if(type!=Type::String||(budget==UINT64_MAX&&operation_budget==UINT64_MAX))return;
- Cursor c{b};
- auto length=[&]() { auto n=c.get(4);if(n>b.size()-c.p)bad("truncated string");c.p+=size_t(n);return n; };
- auto charge=[&](uint64_t n,uint64_t count) {
-  if(n&&count>budget/n)bad("decoded string byte limit exceeded");
-  if(n&&count>operation_budget/n)bad("operation decoded string byte limit exceeded");
-  budget-=n*count;
-  if(operation_budget!=UINT64_MAX)operation_budget-=n*count;
- };
- if(m.encoding==Encoding::Dictionary){
-  auto count=c.get(4);
-  if(count>m.rows||count>(b.size()-c.p)/4)bad("invalid dictionary size");
-  std::vector<uint32_t> lengths;lengths.reserve(size_t(count));
-  for(uint64_t i=0;i<count;++i)lengths.push_back(uint32_t(length()));
-  if(b.size()-c.p!=uint64_t(m.rows)*4)bad("invalid dictionary codes size");
-  for(uint64_t i=0;i<m.rows;++i){auto id=c.get(4);if(id>=lengths.size())bad("invalid dictionary ID");charge(lengths[size_t(id)],1);}
- }else if(m.encoding==Encoding::RLE){
-  uint64_t produced=0;
-  while(produced<m.rows){auto count=c.get(4);if(!count||count>m.rows-produced)bad("invalid run length");charge(length(),count);produced+=count;}
- }else if(m.encoding==Encoding::Plain){
-  for(uint64_t i=0;i<m.rows;++i)charge(length(),1);
- }else bad("invalid string encoding");
- c.done();
+void check_string_budget(const Bytes &b, Type type, const ChunkMeta &m, uint64_t budget,
+                         uint64_t &operation_budget) {
+    if (type != Type::String || (budget == UINT64_MAX && operation_budget == UINT64_MAX))
+        return;
+    Cursor c{b};
+    auto length = [&]() {
+        auto n = c.get(4);
+        if (n > b.size() - c.p)
+            bad("truncated string");
+        c.p += size_t(n);
+        return n;
+    };
+    auto charge = [&](uint64_t n, uint64_t count) {
+        if (n && count > budget / n)
+            bad("decoded string byte limit exceeded");
+        if (n && count > operation_budget / n)
+            bad("operation decoded string byte limit exceeded");
+        budget -= n * count;
+        if (operation_budget != UINT64_MAX)
+            operation_budget -= n * count;
+    };
+    if (m.encoding == Encoding::Dictionary) {
+        auto count = c.get(4);
+        if (count > m.rows || count > (b.size() - c.p) / 4)
+            bad("invalid dictionary size");
+        std::vector<uint32_t> lengths;
+        lengths.reserve(size_t(count));
+        for (uint64_t i = 0; i < count; ++i)
+            lengths.push_back(uint32_t(length()));
+        if (b.size() - c.p != uint64_t(m.rows) * 4)
+            bad("invalid dictionary codes size");
+        for (uint64_t i = 0; i < m.rows; ++i) {
+            auto id = c.get(4);
+            if (id >= lengths.size())
+                bad("invalid dictionary ID");
+            charge(lengths[size_t(id)], 1);
+        }
+    } else if (m.encoding == Encoding::RLE) {
+        uint64_t produced = 0;
+        while (produced < m.rows) {
+            auto count = c.get(4);
+            if (!count || count > m.rows - produced)
+                bad("invalid run length");
+            charge(length(), count);
+            produced += count;
+        }
+    } else if (m.encoding == Encoding::Plain) {
+        for (uint64_t i = 0; i < m.rows; ++i)
+            charge(length(), 1);
+    } else
+        bad("invalid string encoding");
+    c.done();
 }
-void emit(std::ofstream& out,const Bytes& b) { out.write(reinterpret_cast<const char*>(b.data()),static_cast<std::streamsize>(b.size()));if(!out)bad("file write failed"); }
-unsigned width(uint64_t v) { unsigned n=0;while(v){++n;v>>=1;}return n; }
-void pack(Bytes& b,uint64_t v,unsigned w,uint64_t bit) { unsigned used=0;while(used<w){auto pos=bit+used;unsigned k=std::min<unsigned>(w-used,8-unsigned(pos%8));b[size_t(pos/8)]|=uint8_t((v>>used)&((1u<<k)-1))<<unsigned(pos%8);used+=k;} }
-uint64_t unpack(const Bytes& b,size_t start,unsigned w,uint64_t bit) { uint64_t v=0;unsigned used=0;while(used<w){auto pos=bit+used;unsigned k=std::min<unsigned>(w-used,8-unsigned(pos%8));v|=uint64_t((b[start+size_t(pos/8)]>>unsigned(pos%8))&((1u<<k)-1))<<used;used+=k;}return v; }
-struct Encoded { Encoding encoding;Bytes bytes; };
-Encoded encode(const Column& col,size_t begin,uint32_t n,uint32_t sample,Value& lo,Value& hi) {
- bool ints=col.index()==0;
- auto at=[&](size_t i)->Value { if(ints)return std::get<0>(col)[begin+i];return std::get<1>(col)[begin+i]; };
- lo=hi=at(0);Bytes plain;
- for(uint32_t i=0;i<n;++i){auto v=at(i);if(less(v,lo))lo=v;if(less(hi,v))hi=v;value(plain,v);}
- Encoded best{Encoding::Plain,std::move(plain)};
- uint32_t sn=std::min(sample,n),transitions=0;std::unordered_map<std::string,uint32_t> sampled;
- int64_t sample_min=0,sample_max=0;if(ints)sample_min=sample_max=std::get<0>(col)[begin];
- // Evenly spaced sample estimates cardinality; adjacent pairs estimate run density.
- for(uint32_t i=0;i<sn;++i){size_t j=size_t(uint64_t(i)*n/sn);if(j+1<n&&at(j)!=at(j+1))++transitions;if(!ints)sampled.emplace(std::get<std::string>(at(j)),0);else {auto x=std::get<0>(col)[begin+j];sample_min=std::min(sample_min,x);sample_max=std::max(sample_max,x);}}
- if(uint64_t(transitions)*2<sn){Bytes r;uint32_t count=1;auto prev=at(0);for(uint32_t i=1;i<n;++i){if(at(i)==prev){++count;continue;}put(r,count,4);value(r,prev);prev=at(i);count=1;}put(r,count,4);value(r,prev);if(r.size()<best.bytes.size())best={Encoding::RLE,std::move(r)};}
- if(ints&&width(uint64_t(sample_max)-uint64_t(sample_min))<64){int64_t base=std::get<int64_t>(lo);uint64_t span=uint64_t(std::get<int64_t>(hi))-uint64_t(base);unsigned w=width(span);uint64_t bytes=(uint64_t(n)*w+7)/8;if(bytes+9<best.bytes.size()){Bytes b;put(b,uint64_t(base),8);put(b,w,1);b.resize(9+size_t(bytes),0);for(uint32_t i=0;i<n;++i)pack(b,uint64_t(std::get<0>(col)[begin+i])-uint64_t(base),w,uint64_t(i)*w+72);best={Encoding::BitPacked,std::move(b)};}}
- else if(!ints&&sampled.size()*2<=sn){std::unordered_map<std::string,uint32_t> ids;std::vector<std::string> dict;std::vector<uint32_t> codes;codes.reserve(n);for(uint32_t i=0;i<n;++i){const auto& s=std::get<1>(col)[begin+i];auto it=ids.find(s);if(it==ids.end()){auto id=uint32_t(dict.size());ids.emplace(s,id);dict.push_back(s);codes.push_back(id);}else codes.push_back(it->second);}Bytes b;put(b,dict.size(),4);for(auto& s:dict)str(b,s);for(auto id:codes)put(b,id,4);if(b.size()<best.bytes.size())best={Encoding::Dictionary,std::move(b)};}
- return best;
+void emit(std::ofstream &out, const Bytes &b) {
+    out.write(reinterpret_cast<const char *>(b.data()), static_cast<std::streamsize>(b.size()));
+    if (!out)
+        bad("file write failed");
 }
-void charge_predicate(uint64_t& remaining) {
- if(!remaining)bad("operation predicate evaluation limit exceeded");
- --remaining;
+unsigned width(uint64_t v) {
+    unsigned n = 0;
+    while (v) {
+        ++n;
+        v >>= 1;
+    }
+    return n;
 }
-bool matches_all(const Value& v,const std::vector<const Predicate*>& predicates,uint64_t& remaining,uint64_t& comparison_bytes) {
- for(const auto* p:predicates){charge_predicate(remaining);if(!matches(v,*p,comparison_bytes))return false;}
- return true;
+void pack(Bytes &b, uint64_t v, unsigned w, uint64_t bit) {
+    unsigned used = 0;
+    while (used < w) {
+        auto pos = bit + used;
+        unsigned k = std::min<unsigned>(w - used, 8 - unsigned(pos % 8));
+        b[size_t(pos / 8)] |= uint8_t((v >> used) & ((1u << k) - 1)) << unsigned(pos % 8);
+        used += k;
+    }
+}
+uint64_t unpack(const Bytes &b, size_t start, unsigned w, uint64_t bit) {
+    uint64_t v = 0;
+    unsigned used = 0;
+    while (used < w) {
+        auto pos = bit + used;
+        unsigned k = std::min<unsigned>(w - used, 8 - unsigned(pos % 8));
+        v |= uint64_t((b[start + size_t(pos / 8)] >> unsigned(pos % 8)) & ((1u << k) - 1)) << used;
+        used += k;
+    }
+    return v;
+}
+struct Encoded {
+    Encoding encoding;
+    Bytes bytes;
+};
+// Sample locally, then compare actual chunk sizes so a poor sample cannot expand storage.
+Encoded encode(const Column &col, size_t begin, uint32_t n, uint32_t sample, Value &lo, Value &hi) {
+    bool ints = col.index() == 0;
+    auto at = [&](size_t i) -> Value {
+        if (ints)
+            return std::get<0>(col)[begin + i];
+        return std::get<1>(col)[begin + i];
+    };
+    lo = hi = at(0);
+    Bytes plain;
+    for (uint32_t i = 0; i < n; ++i) {
+        auto v = at(i);
+        if (less(v, lo))
+            lo = v;
+        if (less(hi, v))
+            hi = v;
+        value(plain, v);
+    }
+    Encoded best{Encoding::Plain, std::move(plain)};
+    uint32_t sn = std::min(sample, n), transitions = 0;
+    std::unordered_map<std::string, uint32_t> sampled;
+    int64_t sample_min = 0, sample_max = 0;
+    if (ints)
+        sample_min = sample_max = std::get<0>(col)[begin];
+    // Evenly spaced sample estimates cardinality; adjacent pairs estimate run density.
+    for (uint32_t i = 0; i < sn; ++i) {
+        size_t j = size_t(uint64_t(i) * n / sn);
+        if (j + 1 < n && at(j) != at(j + 1))
+            ++transitions;
+        if (!ints)
+            sampled.emplace(std::get<std::string>(at(j)), 0);
+        else {
+            auto x = std::get<0>(col)[begin + j];
+            sample_min = std::min(sample_min, x);
+            sample_max = std::max(sample_max, x);
+        }
+    }
+    if (uint64_t(transitions) * 2 < sn) {
+        Bytes r;
+        uint32_t count = 1;
+        auto prev = at(0);
+        for (uint32_t i = 1; i < n; ++i) {
+            if (at(i) == prev) {
+                ++count;
+                continue;
+            }
+            put(r, count, 4);
+            value(r, prev);
+            prev = at(i);
+            count = 1;
+        }
+        put(r, count, 4);
+        value(r, prev);
+        if (r.size() < best.bytes.size())
+            best = {Encoding::RLE, std::move(r)};
+    }
+    if (ints && width(uint64_t(sample_max) - uint64_t(sample_min)) < 64) {
+        int64_t base = std::get<int64_t>(lo);
+        uint64_t span = uint64_t(std::get<int64_t>(hi)) - uint64_t(base);
+        unsigned w = width(span);
+        uint64_t bytes = (uint64_t(n) * w + 7) / 8;
+        if (bytes + 9 < best.bytes.size()) {
+            Bytes b;
+            put(b, uint64_t(base), 8);
+            put(b, w, 1);
+            b.resize(9 + size_t(bytes), 0);
+            for (uint32_t i = 0; i < n; ++i)
+                pack(b, uint64_t(std::get<0>(col)[begin + i]) - uint64_t(base), w,
+                     uint64_t(i) * w + 72);
+            best = {Encoding::BitPacked, std::move(b)};
+        }
+    } else if (!ints && sampled.size() * 2 <= sn) {
+        std::unordered_map<std::string, uint32_t> ids;
+        std::vector<std::string> dict;
+        std::vector<uint32_t> codes;
+        codes.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto &s = std::get<1>(col)[begin + i];
+            auto it = ids.find(s);
+            if (it == ids.end()) {
+                auto id = uint32_t(dict.size());
+                ids.emplace(s, id);
+                dict.push_back(s);
+                codes.push_back(id);
+            } else
+                codes.push_back(it->second);
+        }
+        Bytes b;
+        put(b, dict.size(), 4);
+        for (auto &s : dict)
+            str(b, s);
+        for (auto id : codes)
+            put(b, id, 4);
+        if (b.size() < best.bytes.size())
+            best = {Encoding::Dictionary, std::move(b)};
+    }
+    return best;
+}
+void charge_predicate(uint64_t &remaining) {
+    if (!remaining)
+        bad("operation predicate evaluation limit exceeded");
+    --remaining;
+}
+bool matches_all(const Value &v, const std::vector<const Predicate *> &predicates,
+                 uint64_t &remaining, uint64_t &comparison_bytes) {
+    for (const auto *p : predicates) {
+        charge_predicate(remaining);
+        if (!matches(v, *p, comparison_bytes))
+            return false;
+    }
+    return true;
 }
 // Calls consume in batches; dictionary scans retain strings once per dictionary only.
-template<class Consume> void walk(const Bytes& b,Type type,const ChunkMeta& m,Consume consume,const std::vector<const Predicate*>* predicates=nullptr,uint64_t* direct=nullptr,std::vector<uint32_t>* selected=nullptr,uint64_t* remaining_evaluations=nullptr,uint64_t* comparison_bytes=nullptr) {
- Cursor c{b};std::vector<std::string> dict;std::vector<uint8_t> dict_matches;
- int64_t base=0;unsigned bits=0;size_t packed=0;
- if(m.encoding==Encoding::Dictionary){if(type!=Type::String)bad("dictionary requires string type");auto count=c.get(4);if(count>m.rows||count>(b.size()-c.p)/4)bad("invalid dictionary size");dict.reserve(size_t(count));for(uint64_t i=0;i<count;++i)dict.push_back(c.string());if(b.size()-c.p!=uint64_t(m.rows)*4)bad("invalid dictionary codes size");if(predicates){for(auto& s:dict)dict_matches.push_back(matches_all(s,*predicates,*remaining_evaluations,*comparison_bytes));}}
- if(m.encoding==Encoding::BitPacked){if(type!=Type::Int64)bad("bitpacking requires integer type");base=signed_bits(c.get(8));bits=unsigned(c.get(1));if(bits>64||b.size()-c.p!=(uint64_t(m.rows)*bits+7)/8)bad("invalid packed data");packed=c.p;}
- if(m.encoding==Encoding::RLE){uint32_t produced=0;while(produced<m.rows){auto count=c.get(4);auto v=value(c,type);if(!count||count>m.rows-produced)bad("invalid run length");if(predicates&&direct){if(matches_all(v,*predicates,*remaining_evaluations,*comparison_bytes)){*direct+=count;if(selected)for(uint32_t i=0;i<count;++i)selected->push_back(produced+i);}}else{for(uint64_t i=0;i<count;++i)consume(v);}produced+=uint32_t(count);}c.done();return;}
- std::array<int64_t,1024> iv{};std::array<uint32_t,1024> ids{};std::array<std::string,1024> sv;
- for(uint32_t offset=0;offset<m.rows;){uint32_t n=std::min<uint32_t>(1024,m.rows-offset);
-  for(uint32_t i=0;i<n;++i){if(m.encoding==Encoding::Dictionary){ids[i]=uint32_t(c.get(4));if(ids[i]>=dict.size())bad("invalid dictionary ID");}else if(m.encoding==Encoding::BitPacked)iv[i]=signed_bits(uint64_t(base)+unpack(b,packed,bits,uint64_t(offset+i)*bits));else if(type==Type::Int64)iv[i]=signed_bits(c.get(8));else sv[i]=c.string();}
-  for(uint32_t i=0;i<n;++i){if(m.encoding==Encoding::Dictionary){if(predicates&&direct){*direct+=dict_matches[ids[i]];if(selected&&dict_matches[ids[i]])selected->push_back(offset+i);}else consume(Value(dict[ids[i]]));}else if(type==Type::Int64)consume(Value(iv[i]));else consume(Value(sv[i]));}offset+=n;
- }
- if(m.encoding!=Encoding::BitPacked)c.done();
+template <class Consume>
+void walk(const Bytes &b, Type type, const ChunkMeta &m, Consume consume,
+          const std::vector<const Predicate *> *predicates = nullptr, uint64_t *direct = nullptr,
+          std::vector<uint32_t> *selected = nullptr, uint64_t *remaining_evaluations = nullptr,
+          uint64_t *comparison_bytes = nullptr) {
+    Cursor c{b};
+    std::vector<std::string> dict;
+    std::vector<uint8_t> dict_matches;
+    int64_t base = 0;
+    unsigned bits = 0;
+    size_t packed = 0;
+    if (m.encoding == Encoding::Dictionary) {
+        if (type != Type::String)
+            bad("dictionary requires string type");
+        auto count = c.get(4);
+        if (count > m.rows || count > (b.size() - c.p) / 4)
+            bad("invalid dictionary size");
+        dict.reserve(size_t(count));
+        for (uint64_t i = 0; i < count; ++i)
+            dict.push_back(c.string());
+        if (b.size() - c.p != uint64_t(m.rows) * 4)
+            bad("invalid dictionary codes size");
+        if (predicates) {
+            for (auto &s : dict)
+                dict_matches.push_back(
+                    matches_all(s, *predicates, *remaining_evaluations, *comparison_bytes));
+        }
+    }
+    if (m.encoding == Encoding::BitPacked) {
+        if (type != Type::Int64)
+            bad("bitpacking requires integer type");
+        base = signed_bits(c.get(8));
+        bits = unsigned(c.get(1));
+        if (bits > 64 || b.size() - c.p != (uint64_t(m.rows) * bits + 7) / 8)
+            bad("invalid packed data");
+        packed = c.p;
+    }
+    if (m.encoding == Encoding::RLE) {
+        uint32_t produced = 0;
+        while (produced < m.rows) {
+            auto count = c.get(4);
+            auto v = value(c, type);
+            if (!count || count > m.rows - produced)
+                bad("invalid run length");
+            if (predicates && direct) {
+                if (matches_all(v, *predicates, *remaining_evaluations, *comparison_bytes)) {
+                    *direct += count;
+                    if (selected)
+                        for (uint32_t i = 0; i < count; ++i)
+                            selected->push_back(produced + i);
+                }
+            } else {
+                for (uint64_t i = 0; i < count; ++i)
+                    consume(v);
+            }
+            produced += uint32_t(count);
+        }
+        c.done();
+        return;
+    }
+    std::array<int64_t, 1024> iv{};
+    std::array<uint32_t, 1024> ids{};
+    std::array<std::string, 1024> sv;
+    for (uint32_t offset = 0; offset < m.rows;) {
+        uint32_t n = std::min<uint32_t>(1024, m.rows - offset);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (m.encoding == Encoding::Dictionary) {
+                ids[i] = uint32_t(c.get(4));
+                if (ids[i] >= dict.size())
+                    bad("invalid dictionary ID");
+            } else if (m.encoding == Encoding::BitPacked)
+                iv[i] = signed_bits(uint64_t(base) +
+                                    unpack(b, packed, bits, uint64_t(offset + i) * bits));
+            else if (type == Type::Int64)
+                iv[i] = signed_bits(c.get(8));
+            else
+                sv[i] = c.string();
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            if (m.encoding == Encoding::Dictionary) {
+                if (predicates && direct) {
+                    *direct += dict_matches[ids[i]];
+                    if (selected && dict_matches[ids[i]])
+                        selected->push_back(offset + i);
+                } else
+                    consume(Value(dict[ids[i]]));
+            } else if (type == Type::Int64)
+                consume(Value(iv[i]));
+            else
+                consume(Value(sv[i]));
+        }
+        offset += n;
+    }
+    if (m.encoding != Encoding::BitPacked)
+        c.done();
 }
 } // namespace
 
-const char* encoding_name(Encoding e) { switch(e){case Encoding::Plain:return "plain";case Encoding::Dictionary:return "dictionary";case Encoding::RLE:return "rle";case Encoding::BitPacked:return "bitpacked";}return "unknown"; }
-void write_file(const std::string& path,const std::vector<Field>& schema,const std::vector<Column>& columns,WriteOptions options) {
- if(schema.empty()||schema.size()!=columns.size()||schema.size()>UINT32_MAX||!options.row_group_size||!options.sample_size)bad("invalid write options/schema");
- size_t rows=std::visit([](auto& v){return v.size();},columns[0]);
- for(size_t i=0;i<columns.size();++i){if(unsigned(schema[i].type)>1||size_t(schema[i].type)!=columns[i].index()||std::visit([](auto& v){return v.size();},columns[i])!=rows)bad("column type/length mismatch");}
- uint64_t ng=(uint64_t(rows)+options.row_group_size-1)/options.row_group_size;if(ng>UINT32_MAX)bad("too many row groups");
- std::ofstream out(path,std::ios::binary|std::ios::trunc);if(!out)bad("cannot create file");Bytes header{'M','I','N','I','C','O','L','1'};put(header,1,4);put(header,options.row_group_size,4);emit(out,header);
- std::vector<std::vector<ChunkMeta>> groups;
- for(size_t begin=0;begin<rows;){uint32_t n=uint32_t(std::min<size_t>(options.row_group_size,rows-begin));std::vector<ChunkMeta> group;for(size_t ci=0;ci<schema.size();++ci){ChunkMeta m;m.rows=n;m.offset=uint64_t(out.tellp());auto e=encode(columns[ci],begin,n,options.sample_size,m.min,m.max);m.encoding=e.encoding;m.bytes=e.bytes.size();emit(out,e.bytes);group.push_back(std::move(m));}groups.push_back(std::move(group));begin+=n;}
- Bytes footer;put(footer,rows,8);put(footer,schema.size(),4);put(footer,groups.size(),4);for(auto& f:schema){str(footer,f.name);put(footer,unsigned(f.type),1);}for(auto& g:groups)for(auto& m:g){put(footer,m.rows,4);put(footer,unsigned(m.encoding),1);put(footer,m.offset,8);put(footer,m.bytes,8);value(footer,m.min);value(footer,m.max);}emit(out,footer);Bytes tail;put(tail,footer.size(),8);const char* magic="MCOLEND1";tail.insert(tail.end(),magic,magic+8);emit(out,tail);out.flush();if(!out)bad("file flush failed");out.close();if(!out)bad("file close failed");
-}
-Reader::Reader(const std::string& path,ReadLimits limits):path_(path),max_decoded_string_bytes_(limits.max_decoded_string_bytes),max_payload_bytes_per_operation_(limits.max_payload_bytes_per_operation),max_decoded_rows_per_operation_(limits.max_decoded_rows_per_operation),max_predicates_per_operation_(limits.max_predicates_per_operation),max_predicate_evaluations_per_operation_(limits.max_predicate_evaluations_per_operation),max_string_comparison_bytes_per_operation_(limits.max_string_comparison_bytes_per_operation),max_decoded_string_bytes_per_operation_(limits.max_decoded_string_bytes_per_operation) {
- std::ifstream in(path,std::ios::binary|std::ios::ate);if(!in)bad("cannot open file");auto end=in.tellg();if(end<32)bad("file too short");uint64_t size=uint64_t(end);auto h=load(in,0,16);if(std::memcmp(h.data(),"MINICOL1",8))bad("invalid file magic");Cursor hc{h,8};if(hc.get(4)!=1)bad("unsupported format version");auto group_size=hc.get(4);if(!group_size)bad("invalid row group size");auto t=load(in,size-16,16);if(std::memcmp(t.data()+8,"MCOLEND1",8))bad("invalid trailer");Cursor tc{t};auto fl=tc.get(8);if(fl>size-32||fl<16)bad("invalid footer size");if(fl>limits.max_footer_bytes)bad("footer byte limit exceeded");auto b=load(in,size-16-fl,fl);Cursor c{b};rows_=c.get(8);auto nc=c.get(4),ng=c.get(4);if(!nc||nc>(b.size()-c.p)/5||ng!=(rows_/group_size+(rows_%group_size!=0)))bad("invalid schema/group count");if(std::min<uint64_t>(rows_,group_size)>limits.max_group_rows)bad("group row limit exceeded");
- // nc and ng are uint32 fields: nc * (ng + 1) fits in uint64, even at their maxima.
- // Count schema and chunk objects before parsing names or constructing metadata.
- if(nc*(ng+1)>limits.max_metadata_entries)bad("metadata entry limit exceeded");
- for(uint64_t i=0;i<nc;++i){auto name=c.string();auto ty=c.get(1);if(ty>1)bad("invalid column type");schema_.push_back({name,Type(ty)});}if(ng&&(nc>(b.size()-c.p)/ng/29))bad("footer metadata truncated");
- uint64_t expected_offset=16,total_rows=0;
- for(uint64_t g=0;g<ng;++g){std::vector<ChunkMeta> group;uint32_t group_rows=uint32_t(std::min<uint64_t>(group_size,rows_-total_rows));for(uint64_t ci=0;ci<nc;++ci){ChunkMeta m;m.rows=uint32_t(c.get(4));auto enc=c.get(1);if(enc>3)bad("invalid encoding");m.encoding=Encoding(enc);m.offset=c.get(8);m.bytes=c.get(8);m.min=value(c,schema_[size_t(ci)].type);m.max=value(c,schema_[size_t(ci)].type);if(m.rows!=group_rows||!m.rows||less(m.max,m.min)||m.offset!=expected_offset||m.offset>size-16-fl||m.bytes>size-16-fl-m.offset)bad("invalid chunk metadata");if((m.encoding==Encoding::Dictionary&&schema_[size_t(ci)].type!=Type::String)||(m.encoding==Encoding::BitPacked&&schema_[size_t(ci)].type!=Type::Int64))bad("invalid encoding/type combination");if(m.bytes>limits.max_chunk_bytes)bad("chunk byte limit exceeded");expected_offset+=m.bytes;group.push_back(std::move(m));}total_rows+=group_rows;groups_.push_back(std::move(group));}
- c.done();if(expected_offset!=size-16-fl)bad("unexpected payload bytes");metadata_bytes_=32+fl;
-}
-Column Reader::read_column(size_t group,size_t column) const {
- if(group>=groups_.size()||column>=schema_.size())throw std::out_of_range("group/column");
- auto& m=groups_[group][column];uint64_t remaining=max_payload_bytes_per_operation_,remaining_rows=max_decoded_rows_per_operation_,remaining_strings=max_decoded_string_bytes_per_operation_;charge_rows(m,remaining_rows);std::ifstream in(path_,std::ios::binary);auto b=load_payload(in,m,remaining);check_string_budget(b,schema_[column].type,m,max_decoded_string_bytes_,remaining_strings);Column result;if(schema_[column].type==Type::Int64)result=std::vector<int64_t>{};else result=std::vector<std::string>{};walk(b,schema_[column].type,m,[&](const Value& v){if(v.index()==0)std::get<0>(result).push_back(std::get<0>(v));else std::get<1>(result).push_back(std::get<1>(v));});return result;
-}
-ScanResult Reader::scan(const Predicate& p,bool zones) const {
- return scan_all({p},zones);
-}
-ScanResult Reader::scan_all(const std::vector<Predicate>& predicates,bool zones) const {
- return scan_impl(predicates,zones,nullptr).scan;
-}
-SumResult Reader::sum_int64(size_t column,const std::vector<Predicate>& predicates,bool zones) const {
- if(column>=schema_.size())throw std::out_of_range("projection column");
- if(schema_[column].type!=Type::Int64)bad("sum requires integer column");
- return scan_impl(predicates,zones,&column);
-}
-SumResult Reader::scan_impl(const std::vector<Predicate>& predicates,bool zones,const size_t* projection) const {
- if(predicates.size()>max_predicates_per_operation_)bad("operation predicate limit exceeded");
- // Validate every predicate before pruning or short-circuiting any payload reads.
- std::vector<size_t> columns;
- std::vector<std::vector<const Predicate*>> by_column;
- for(const auto& p:predicates){
-  if(p.column>=schema_.size())throw std::out_of_range("predicate column");
-  if(p.op!=Op::Equal&&p.op!=Op::Between)bad("invalid predicate operation");
-  size_t ty=size_t(schema_[p.column].type);
-  if(p.low.index()!=ty||(p.op==Op::Between&&p.high.index()!=ty))bad("predicate type mismatch");
-  auto it=std::find(columns.begin(),columns.end(),p.column);
-  if(it==columns.end()){columns.push_back(p.column);by_column.push_back({&p});}
-  else by_column[size_t(it-columns.begin())].push_back(&p);
- }
- SumResult aggregate;auto& result=aggregate.scan;result.bytes_read=metadata_bytes_;
- uint64_t sum=0,remaining=max_payload_bytes_per_operation_,remaining_rows=max_decoded_rows_per_operation_;
- uint64_t remaining_evaluations=max_predicate_evaluations_per_operation_;
- uint64_t comparison_bytes=max_string_comparison_bytes_per_operation_;
- uint64_t remaining_strings=max_decoded_string_bytes_per_operation_;
- if(predicates.empty()&&!projection){result.matched=rows_;return aggregate;}
- std::ifstream in(path_,std::ios::binary);
- for(const auto& group:groups_){
-  bool skip=false;
-  if(zones)for(const auto& p:predicates){
-   charge_predicate(remaining_evaluations);
-   const auto& m=group[p.column];
-   skip=p.op==Op::Equal?(query_less(p.low,m.min,comparison_bytes)||query_less(m.max,p.low,comparison_bytes)):
-       (query_less(p.high,m.min,comparison_bytes)||query_less(m.max,p.low,comparison_bytes)||query_less(p.high,p.low,comparison_bytes));
-   if(skip)break;
-  }
-  if(skip){++result.groups_skipped;continue;}
-  ++result.groups_read;result.batches+=(uint64_t(group.front().rows)+1023)/1024;
-  std::vector<uint32_t> selection;
-  Bytes projected;bool projection_loaded=false;
-  for(size_t ci=0;ci<columns.size();++ci){
-   const auto column=columns[ci];const auto& m=group[column];
-   charge_rows(m,remaining_rows);
-   auto b=load_payload(in,m,remaining);result.bytes_read+=m.bytes;
-   check_string_budget(b,schema_[column].type,m,max_decoded_string_bytes_,remaining_strings);
-   uint64_t matched=0;uint32_t row=0;
-   // Single-column counts keep the encoded count fast path and need no selection.
-   if(columns.size()==1&&!projection){
-    walk(b,schema_[column].type,m,[&](const Value& v){matched+=matches_all(v,by_column[ci],remaining_evaluations,comparison_bytes);},&by_column[ci],&matched,nullptr,&remaining_evaluations,&comparison_bytes);
-    result.matched+=matched;break;
-   }
-   std::vector<uint32_t> hits;
-   walk(b,schema_[column].type,m,[&](const Value& v){
-    if(matches_all(v,by_column[ci],remaining_evaluations,comparison_bytes))hits.push_back(row);
-    ++row;
-   },&by_column[ci],&matched,&hits,&remaining_evaluations,&comparison_bytes);
-   if(projection&&column==*projection){projected=std::move(b);projection_loaded=true;}
-   if(ci==0)selection=std::move(hits);
-   else {
-    // Both vectors are sorted group-local row offsets. Compact in place.
-    size_t out=0,j=0;
-    for(auto selected:selection){
-     while(j<hits.size()&&hits[j]<selected)++j;
-     if(j<hits.size()&&hits[j]==selected)selection[out++]=selected;
+const char *encoding_name(Encoding e) {
+    switch (e) {
+    case Encoding::Plain:
+        return "plain";
+    case Encoding::Dictionary:
+        return "dictionary";
+    case Encoding::RLE:
+        return "rle";
+    case Encoding::BitPacked:
+        return "bitpacked";
     }
-    selection.resize(out);
-   }
-   if(selection.empty())break;
-  }
-  if(projection){
-   if(!predicates.empty()&&selection.empty())continue;
-   const auto& m=group[*projection];
-   charge_rows(m,remaining_rows);
-   if(!projection_loaded){projected=load_payload(in,m,remaining);result.bytes_read+=m.bytes;}
-   uint32_t row=0;size_t selected=0;
-   walk(projected,Type::Int64,m,[&](const Value& v){
-    if(predicates.empty()||(selected<selection.size()&&selection[selected]==row)){
-     sum+=uint64_t(std::get<int64_t>(v));++selected;
+    return "unknown";
+}
+void write_file(const std::string &path, const std::vector<Field> &schema,
+                const std::vector<Column> &columns, WriteOptions options) {
+    if (schema.empty() || schema.size() != columns.size() || schema.size() > UINT32_MAX ||
+        !options.row_group_size || !options.sample_size)
+        bad("invalid write options/schema");
+    size_t rows = std::visit([](auto &v) { return v.size(); }, columns[0]);
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (unsigned(schema[i].type) > 1 || size_t(schema[i].type) != columns[i].index() ||
+            std::visit([](auto &v) { return v.size(); }, columns[i]) != rows)
+            bad("column type/length mismatch");
     }
-    ++row;
-   });
-   result.matched+=predicates.empty()?m.rows:selection.size();
-  }else if(columns.size()>1)result.matched+=selection.size();
- }
- aggregate.sum=signed_bits(sum);
- return aggregate;
+    uint64_t ng = (uint64_t(rows) + options.row_group_size - 1) / options.row_group_size;
+    if (ng > UINT32_MAX)
+        bad("too many row groups");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        bad("cannot create file");
+    Bytes header{'M', 'I', 'N', 'I', 'C', 'O', 'L', '1'};
+    put(header, 1, 4);
+    put(header, options.row_group_size, 4);
+    emit(out, header);
+    std::vector<std::vector<ChunkMeta>> groups;
+    for (size_t begin = 0; begin < rows;) {
+        uint32_t n = uint32_t(std::min<size_t>(options.row_group_size, rows - begin));
+        std::vector<ChunkMeta> group;
+        for (size_t ci = 0; ci < schema.size(); ++ci) {
+            ChunkMeta m;
+            m.rows = n;
+            m.offset = uint64_t(out.tellp());
+            auto e = encode(columns[ci], begin, n, options.sample_size, m.min, m.max);
+            m.encoding = e.encoding;
+            m.bytes = e.bytes.size();
+            emit(out, e.bytes);
+            group.push_back(std::move(m));
+        }
+        groups.push_back(std::move(group));
+        begin += n;
+    }
+    Bytes footer;
+    put(footer, rows, 8);
+    put(footer, schema.size(), 4);
+    put(footer, groups.size(), 4);
+    for (auto &f : schema) {
+        str(footer, f.name);
+        put(footer, unsigned(f.type), 1);
+    }
+    for (auto &g : groups)
+        for (auto &m : g) {
+            put(footer, m.rows, 4);
+            put(footer, unsigned(m.encoding), 1);
+            put(footer, m.offset, 8);
+            put(footer, m.bytes, 8);
+            value(footer, m.min);
+            value(footer, m.max);
+        }
+    emit(out, footer);
+    Bytes tail;
+    put(tail, footer.size(), 8);
+    const char *magic = "MCOLEND1";
+    tail.insert(tail.end(), magic, magic + 8);
+    emit(out, tail);
+    out.flush();
+    if (!out)
+        bad("file flush failed");
+    out.close();
+    if (!out)
+        bad("file close failed");
+}
+// Locate and validate metadata first; column payloads are loaded only when requested.
+Reader::Reader(const std::string &path, ReadLimits limits)
+    : path_(path), max_decoded_string_bytes_(limits.max_decoded_string_bytes),
+      max_payload_bytes_per_operation_(limits.max_payload_bytes_per_operation),
+      max_decoded_rows_per_operation_(limits.max_decoded_rows_per_operation),
+      max_predicates_per_operation_(limits.max_predicates_per_operation),
+      max_predicate_evaluations_per_operation_(limits.max_predicate_evaluations_per_operation),
+      max_string_comparison_bytes_per_operation_(limits.max_string_comparison_bytes_per_operation),
+      max_decoded_string_bytes_per_operation_(limits.max_decoded_string_bytes_per_operation) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in)
+        bad("cannot open file");
+    auto end = in.tellg();
+    if (end < 32)
+        bad("file too short");
+    uint64_t size = uint64_t(end);
+    auto h = load(in, 0, 16);
+    if (std::memcmp(h.data(), "MINICOL1", 8))
+        bad("invalid file magic");
+    Cursor hc{h, 8};
+    if (hc.get(4) != 1)
+        bad("unsupported format version");
+    auto group_size = hc.get(4);
+    if (!group_size)
+        bad("invalid row group size");
+    auto t = load(in, size - 16, 16);
+    if (std::memcmp(t.data() + 8, "MCOLEND1", 8))
+        bad("invalid trailer");
+    Cursor tc{t};
+    auto fl = tc.get(8);
+    if (fl > size - 32 || fl < 16)
+        bad("invalid footer size");
+    if (fl > limits.max_footer_bytes)
+        bad("footer byte limit exceeded");
+    auto b = load(in, size - 16 - fl, fl);
+    Cursor c{b};
+    rows_ = c.get(8);
+    auto nc = c.get(4), ng = c.get(4);
+    if (!nc || nc > (b.size() - c.p) / 5 || ng != (rows_ / group_size + (rows_ % group_size != 0)))
+        bad("invalid schema/group count");
+    if (std::min<uint64_t>(rows_, group_size) > limits.max_group_rows)
+        bad("group row limit exceeded");
+    // nc and ng are uint32 fields: nc * (ng + 1) fits in uint64, even at their maxima.
+    // Count schema and chunk objects before parsing names or constructing metadata.
+    if (nc * (ng + 1) > limits.max_metadata_entries)
+        bad("metadata entry limit exceeded");
+    for (uint64_t i = 0; i < nc; ++i) {
+        auto name = c.string();
+        auto ty = c.get(1);
+        if (ty > 1)
+            bad("invalid column type");
+        schema_.push_back({name, Type(ty)});
+    }
+    if (ng && (nc > (b.size() - c.p) / ng / 29))
+        bad("footer metadata truncated");
+    uint64_t expected_offset = 16, total_rows = 0;
+    for (uint64_t g = 0; g < ng; ++g) {
+        std::vector<ChunkMeta> group;
+        uint32_t group_rows = uint32_t(std::min<uint64_t>(group_size, rows_ - total_rows));
+        for (uint64_t ci = 0; ci < nc; ++ci) {
+            ChunkMeta m;
+            m.rows = uint32_t(c.get(4));
+            auto enc = c.get(1);
+            if (enc > 3)
+                bad("invalid encoding");
+            m.encoding = Encoding(enc);
+            m.offset = c.get(8);
+            m.bytes = c.get(8);
+            m.min = value(c, schema_[size_t(ci)].type);
+            m.max = value(c, schema_[size_t(ci)].type);
+            if (m.rows != group_rows || !m.rows || less(m.max, m.min) ||
+                m.offset != expected_offset || m.offset > size - 16 - fl ||
+                m.bytes > size - 16 - fl - m.offset)
+                bad("invalid chunk metadata");
+            if ((m.encoding == Encoding::Dictionary && schema_[size_t(ci)].type != Type::String) ||
+                (m.encoding == Encoding::BitPacked && schema_[size_t(ci)].type != Type::Int64))
+                bad("invalid encoding/type combination");
+            if (m.bytes > limits.max_chunk_bytes)
+                bad("chunk byte limit exceeded");
+            expected_offset += m.bytes;
+            group.push_back(std::move(m));
+        }
+        total_rows += group_rows;
+        groups_.push_back(std::move(group));
+    }
+    c.done();
+    if (expected_offset != size - 16 - fl)
+        bad("unexpected payload bytes");
+    metadata_bytes_ = 32 + fl;
+}
+Column Reader::read_column(size_t group, size_t column) const {
+    if (group >= groups_.size() || column >= schema_.size())
+        throw std::out_of_range("group/column");
+    auto &m = groups_[group][column];
+    uint64_t remaining = max_payload_bytes_per_operation_,
+             remaining_rows = max_decoded_rows_per_operation_,
+             remaining_strings = max_decoded_string_bytes_per_operation_;
+    charge_rows(m, remaining_rows);
+    std::ifstream in(path_, std::ios::binary);
+    auto b = load_payload(in, m, remaining);
+    check_string_budget(b, schema_[column].type, m, max_decoded_string_bytes_, remaining_strings);
+    Column result;
+    if (schema_[column].type == Type::Int64)
+        result = std::vector<int64_t>{};
+    else
+        result = std::vector<std::string>{};
+    walk(b, schema_[column].type, m, [&](const Value &v) {
+        if (v.index() == 0)
+            std::get<0>(result).push_back(std::get<0>(v));
+        else
+            std::get<1>(result).push_back(std::get<1>(v));
+    });
+    return result;
+}
+ScanResult Reader::scan(const Predicate &p, bool zones) const {
+    return scan_all({p}, zones);
+}
+ScanResult Reader::scan_all(const std::vector<Predicate> &predicates, bool zones) const {
+    return scan_impl(predicates, zones, nullptr).scan;
+}
+SumResult Reader::sum_int64(size_t column, const std::vector<Predicate> &predicates,
+                            bool zones) const {
+    if (column >= schema_.size())
+        throw std::out_of_range("projection column");
+    if (schema_[column].type != Type::Int64)
+        bad("sum requires integer column");
+    return scan_impl(predicates, zones, &column);
+}
+SumResult Reader::scan_impl(const std::vector<Predicate> &predicates, bool zones,
+                            const size_t *projection) const {
+    if (predicates.size() > max_predicates_per_operation_)
+        bad("operation predicate limit exceeded");
+    // Validate every predicate before pruning or short-circuiting any payload reads.
+    std::vector<size_t> columns;
+    std::vector<std::vector<const Predicate *>> by_column;
+    for (const auto &p : predicates) {
+        if (p.column >= schema_.size())
+            throw std::out_of_range("predicate column");
+        if (p.op != Op::Equal && p.op != Op::Between)
+            bad("invalid predicate operation");
+        size_t ty = size_t(schema_[p.column].type);
+        if (p.low.index() != ty || (p.op == Op::Between && p.high.index() != ty))
+            bad("predicate type mismatch");
+        auto it = std::find(columns.begin(), columns.end(), p.column);
+        if (it == columns.end()) {
+            columns.push_back(p.column);
+            by_column.push_back({&p});
+        } else
+            by_column[size_t(it - columns.begin())].push_back(&p);
+    }
+    SumResult aggregate;
+    auto &result = aggregate.scan;
+    result.bytes_read = metadata_bytes_;
+    uint64_t sum = 0, remaining = max_payload_bytes_per_operation_,
+             remaining_rows = max_decoded_rows_per_operation_;
+    uint64_t remaining_evaluations = max_predicate_evaluations_per_operation_;
+    uint64_t comparison_bytes = max_string_comparison_bytes_per_operation_;
+    uint64_t remaining_strings = max_decoded_string_bytes_per_operation_;
+    if (predicates.empty() && !projection) {
+        result.matched = rows_;
+        return aggregate;
+    }
+    std::ifstream in(path_, std::ios::binary);
+    for (const auto &group : groups_) {
+        bool skip = false;
+        // Rule out groups before paying for any column payload reads.
+        if (zones)
+            for (const auto &p : predicates) {
+                charge_predicate(remaining_evaluations);
+                const auto &m = group[p.column];
+                skip = p.op == Op::Equal ? (query_less(p.low, m.min, comparison_bytes) ||
+                                            query_less(m.max, p.low, comparison_bytes))
+                                         : (query_less(p.high, m.min, comparison_bytes) ||
+                                            query_less(m.max, p.low, comparison_bytes) ||
+                                            query_less(p.high, p.low, comparison_bytes));
+                if (skip)
+                    break;
+            }
+        if (skip) {
+            ++result.groups_skipped;
+            continue;
+        }
+        ++result.groups_read;
+        result.batches += (uint64_t(group.front().rows) + 1023) / 1024;
+        std::vector<uint32_t> selection;
+        Bytes projected;
+        bool projection_loaded = false;
+        for (size_t ci = 0; ci < columns.size(); ++ci) {
+            const auto column = columns[ci];
+            const auto &m = group[column];
+            charge_rows(m, remaining_rows);
+            auto b = load_payload(in, m, remaining);
+            result.bytes_read += m.bytes;
+            check_string_budget(b, schema_[column].type, m, max_decoded_string_bytes_,
+                                remaining_strings);
+            uint64_t matched = 0;
+            uint32_t row = 0;
+            // Single-column counts keep the encoded count fast path and need no selection.
+            if (columns.size() == 1 && !projection) {
+                walk(
+                    b, schema_[column].type, m,
+                    [&](const Value &v) {
+                        matched +=
+                            matches_all(v, by_column[ci], remaining_evaluations, comparison_bytes);
+                    },
+                    &by_column[ci], &matched, nullptr, &remaining_evaluations, &comparison_bytes);
+                result.matched += matched;
+                break;
+            }
+            std::vector<uint32_t> hits;
+            walk(
+                b, schema_[column].type, m,
+                [&](const Value &v) {
+                    if (matches_all(v, by_column[ci], remaining_evaluations, comparison_bytes))
+                        hits.push_back(row);
+                    ++row;
+                },
+                &by_column[ci], &matched, &hits, &remaining_evaluations, &comparison_bytes);
+            if (projection && column == *projection) {
+                projected = std::move(b);
+                projection_loaded = true;
+            }
+            if (ci == 0)
+                selection = std::move(hits);
+            else {
+                // Both vectors are sorted group-local row offsets. Compact in place.
+                size_t out = 0, j = 0;
+                for (auto selected : selection) {
+                    while (j < hits.size() && hits[j] < selected)
+                        ++j;
+                    if (j < hits.size() && hits[j] == selected)
+                        selection[out++] = selected;
+                }
+                selection.resize(out);
+            }
+            if (selection.empty())
+                break;
+        }
+        if (projection) {
+            if (!predicates.empty() && selection.empty())
+                continue;
+            const auto &m = group[*projection];
+            charge_rows(m, remaining_rows);
+            if (!projection_loaded) {
+                projected = load_payload(in, m, remaining);
+                result.bytes_read += m.bytes;
+            }
+            uint32_t row = 0;
+            size_t selected = 0;
+            walk(projected, Type::Int64, m, [&](const Value &v) {
+                if (predicates.empty() ||
+                    (selected < selection.size() && selection[selected] == row)) {
+                    sum += uint64_t(std::get<int64_t>(v));
+                    ++selected;
+                }
+                ++row;
+            });
+            result.matched += predicates.empty() ? m.rows : selection.size();
+        } else if (columns.size() > 1)
+            result.matched += selection.size();
+    }
+    aggregate.sum = signed_bits(sum);
+    return aggregate;
 }
 } // namespace minicol

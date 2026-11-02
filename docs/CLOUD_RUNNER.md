@@ -1,8 +1,12 @@
 # Cloud worker for minicol
 
-The active GitHub Actions workflow is `.github/workflows/cloud-agent.yml`; `docs/cloud-agent-workflow.yml` is a reviewable copy. GitHub-hosted Ubuntu runners can work while the owner's laptop is off. The worker is hourly, at minute 17 UTC, and also supports manual dispatch. GitHub schedules can be delayed; this is periodic development, not an always-running server.
+The GitHub Actions development workflow is currently disabled. Its definition is `.github/workflows/cloud-agent.yml`; `docs/cloud-agent-workflow.yml` is a reviewable copy. GitHub-hosted Ubuntu runners can work while the owner's laptop is off. The worker is hourly, at minute 17 UTC, and also supports manual dispatch. GitHub schedules can be delayed; this is periodic development, not an always-running server.
 
-## Verified status — 2026-10-27
+## Current status — 2026-11-02
+
+The owner has stopped API-funded development. MINICOL_AGENT_ENABLED is false and the Minicol cloud agent workflow is disabled in GitHub. The local automation remains paused. Normal correctness CI remains enabled and uses no OpenAI API key. The worker delivered 14 cloud commits through October 30; later generation attempts failed with API quota errors. No API credit top-up is required to build or use the engine.
+
+## Initial activation — 2026-10-27
 
 The OPENAI_API_KEY secret is installed, MINICOL_AGENT_ENABLED is true, and the first full [cloud run](https://github.com/bhinu/minicol/actions/runs/40596007041) passed generation, isolated validation, and publication. It pushed [af440d8](https://github.com/bhinu/minicol/commit/af440d88af2e535768be006058f9bfdc81355677), adding conjunction predicates with selection vectors. GitHub resolves the author to bhinu; the committer is github-actions[bot]. The earlier local hourly automation has been paused. Linux and macOS correctness CI also passed on the setup commit.
 

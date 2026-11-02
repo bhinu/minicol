@@ -2,7 +2,7 @@ CXX = c++
 CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic
 CPPFLAGS = -Iinclude
 FUZZ_CXX ?= clang++
-.PHONY: all test sanitize fuzz fuzz-seeds bench clean
+.PHONY: all test sanitize fuzz fuzz-seeds bench demo clean
 all: build/test_engine build/benchmark
 build:
 	mkdir -p build
@@ -10,6 +10,10 @@ build/test_engine: src/engine.cpp tests/test_engine.cpp tests/packed_fixture.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) src/engine.cpp tests/test_engine.cpp -o $@
 build/benchmark: src/engine.cpp bench/benchmark.cpp include/minicol/engine.hpp | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) src/engine.cpp bench/benchmark.cpp -o $@
+build/demo: src/engine.cpp examples/query.cpp include/minicol/engine.hpp | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) src/engine.cpp examples/query.cpp -o $@
+demo: build/demo
+	./build/demo
 test: build/test_engine
 	./build/test_engine
 sanitize: | build

@@ -16,7 +16,7 @@
 4. Benchmark uniform versus clustered distributions, multiple group sizes, and narrow/wide rows. Add a strong uncompressed column baseline to isolate encoding from projection benefits.
 5. Improve bit unpacking hot loops only after profiling; report before/after measurements with compiler and machine details.
 
-Every scheduled run should choose one bounded improvement, validate it, update this log, and commit/push useful changes. Do not manufacture commit activity or benchmark claims. Resume handoff numbers describe the checked-in initial raw results; refresh claims explicitly when rerunning.
+While enabled, a scheduled run should choose one bounded improvement, validate it, update this log, and commit/push useful changes. The API-funded development schedule is disabled as of November 2. Do not manufacture commit activity or benchmark claims. Resume handoff numbers describe the checked-in initial raw results; refresh claims explicitly when rerunning.
 
 ## Cloud runner preparation — 2026-10-27
 
@@ -647,3 +647,7 @@ First cloud run 40596007041 passed all three jobs and published af440d8 with bhi
   fuzz oracles still materialize accepted payloads and require trustworthy bounds
   for pruned checks. Streaming writes and bounded-memory readers remain the next
   larger feature; checksums, expanded benchmarks, and profiling remain later items.
+
+## Readability and project presentation — 2026-11-02
+
+Rewrote README around the storage problem, design decisions, query path, measured evidence, and limitations. Added a six-row `make demo` example that counts/sums filtered rows and visibly skips two of three groups. Formatted the core implementation and public header consistently and added comments explaining bounds checks, encoding selection, and metadata-first reads; no query or format semantics changed. Updated resume facts and automation status. The cloud worker is disabled and its enable variable is false; local automation remains paused, and ordinary correctness CI stays enabled. Original benchmark trials and claims are preserved as historical evidence.
